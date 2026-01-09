@@ -133,22 +133,22 @@ class WSNAbstractEnv(gym.Env):
         # ---------------------------------------------------------
         connectivity_score = np.sum(self.connectivity) / (self.num_nodes * (self.num_nodes - 1)) #جودة الاتصال
         energy_efficiency = 1.0 - np.mean(transmit_power) #كفاءة الطاقة
-        sleep_efficiency = np.mean(sleep_schedule) #( كفاءة النوم (اعلى احسن
+        battery_health = np.mean(self.battery_levels) # حماية البطارية
         
-        # حساب المكافأة الأساسية الموزونة
+        # حساب المكافأة الأساسية الموزونة (بدون مكافأة النوم المباشرة)
         reward = (
-            0.4 * connectivity_score + # وزن جودة الاتصال
+            0.5 * connectivity_score + # وزن جودة الاتصال
             0.3 * energy_efficiency +  # وزن توفير الطاقة
-            0.3 * sleep_efficiency     # وزن نظام النوم
+            0.2 * battery_health       # وزن حماية البطارية
         )
 
         # ==========================================
-        # مثال لإضافة عقوبة (Penalty Example):
-        # سنقوم بخصم نقاط كبيرة إذا مات أي حساس (بطاريته = 0)
-        # هذا يجبر الذكاء الاصطناعي على أن يكون حذراً جداً ولا يفرغ البطاريات.
+        # عقوبة تناسبية لنفاد البطارية (Proportional Penalty):
+        # بدلاً من عقوبة ثابتة -5، نخصم بنسبة عدد العقد الميتة
         # ==========================================
-        if np.any(self.battery_levels <= 0):
-            reward -= 5.0  # خصم 5 نقاط كـ "عقوبة" قوية
+        dead_nodes = np.sum(self.battery_levels <= 0)
+        if dead_nodes > 0:
+            reward -= 5.0 * (dead_nodes / self.num_nodes)  # عقوبة تناسبية
             
         return reward
     

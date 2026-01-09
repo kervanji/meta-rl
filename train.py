@@ -30,7 +30,7 @@ def create_tasks(num_tasks: int, env_config: Dict = None) -> List[gym.Env]:
     tasks = []
     for _ in range(num_tasks):
         config = env_config.copy()
-        config['comm_range'] = np.random.uniform(0.25, 0.4)
+        config['comm_range'] = env_config['comm_range']   # يأخذ قيمة الـGUI
         
         env = WSNEnv(config)
         tasks.append(env)
