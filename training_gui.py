@@ -174,18 +174,24 @@ class CollapsibleSection(tk.Frame):
 class SettingRow(tk.Frame):
     """Setting row with label, slider, and value"""
     def __init__(self, parent, label, default_value, min_val=0, max_val=100, 
-                 is_float=False, **kwargs):
+                 is_float=False, description='', **kwargs):
         super().__init__(parent, bg=COLORS['bg_dark'], **kwargs)
         
         self.is_float = is_float
         self.min_val = min_val
         self.max_val = max_val
+        self.description = description
+        self._popup = None
         
         lbl = tk.Label(self, text=label,
                       font=('Segoe UI', 10),
                       fg=COLORS['text_primary'],
-                      bg=COLORS['bg_dark'])
+                      bg=COLORS['bg_dark'],
+                      cursor='hand2' if description else '')
         lbl.pack(anchor='w')
+        
+        if description:
+            lbl.bind('<Button-1>', self._show_description)
         
         row = tk.Frame(self, bg=COLORS['bg_dark'])
         row.pack(fill='x', pady=(5, 0))
@@ -226,6 +232,40 @@ class SettingRow(tk.Frame):
     
     def get(self):
         return self.var.get()
+    
+    def _show_description(self, event):
+        if self._popup:
+            self._popup.destroy()
+            self._popup = None
+            return
+        
+        self._popup = tk.Toplevel(self)
+        self._popup.overrideredirect(True)
+        self._popup.configure(bg=COLORS['border'])
+        
+        inner = tk.Frame(self._popup, bg=COLORS['bg_card'], padx=1, pady=1)
+        inner.pack(fill='both', expand=True, padx=1, pady=1)
+        
+        msg = tk.Label(inner, text=self.description,
+                      font=('Segoe UI', 9),
+                      fg=COLORS['text_primary'],
+                      bg=COLORS['bg_card'],
+                      wraplength=280,
+                      justify='right',
+                      padx=12, pady=10)
+        msg.pack()
+        
+        x = event.widget.winfo_rootx()
+        y = event.widget.winfo_rooty() + event.widget.winfo_height() + 4
+        self._popup.geometry(f'+{x}+{y}')
+        
+        self._popup.after(5000, lambda: self._close_popup())
+        self._popup.bind('<Button-1>', lambda e: self._close_popup())
+    
+    def _close_popup(self):
+        if self._popup:
+            self._popup.destroy()
+            self._popup = None
 
 
 class TrainingGUI:
@@ -364,43 +404,54 @@ class TrainingGUI:
         net_section.pack(fill='x', pady=(0, 20))
         
         self.setting_nodes = SettingRow(net_section.content, "Number of Nodes", 
-                                        100, 10, 500)
+                                        100, 10, 500,
+                                        description="Sensor count in the network.\nMore = bigger network, slower training.")
         self.setting_nodes.pack(fill='x', pady=5)
         
         self.setting_range = SettingRow(net_section.content, "Communication Range",
-                                        0.15, 0.05, 0.5, is_float=True)
+                                        0.15, 0.05, 0.5, is_float=True,
+                                        description="Max distance nodes can talk.\nLow = weak links, harder task.\nHigh = strong links, easier task.")
         self.setting_range.pack(fill='x', pady=5)
         
         self.setting_energy = SettingRow(net_section.content, "Energy Consumption",
-                                         0.05, 0.01, 0.2, is_float=True)
+                                         0.05, 0.01, 0.2, is_float=True,
+                                        description="Battery drain per step.\nHigh = batteries die fast,\nmodel must save energy better.")
         self.setting_energy.pack(fill='x', pady=5)
         
         self.setting_steps = SettingRow(net_section.content, "Max Steps",
-                                        100, 10, 500)
+                                        100, 10, 500,
+                                        description="Steps per episode.\nMore = longer episodes, more data,\nbut slower training.")
         self.setting_steps.pack(fill='x', pady=5)
         
         train_section = CollapsibleSection(sidebar, "Training Settings", icon='⚙')
         train_section.pack(fill='x', pady=(0, 20))
         
         self.setting_iterations = SettingRow(train_section.content, "Meta Iterations",
-                                             1000, 100, 10000)
+                                             1000, 100, 10000,
+                                        description="Total training rounds.\nMore = better model, takes longer.")
         self.setting_iterations.pack(fill='x', pady=5)
         
         self.setting_batch = SettingRow(train_section.content, "Meta Batch Size",
-                                        5, 1, 20)
+                                        5, 1, 20,
+                                        description="Tasks per round.\nMore = stable learning, but slower.")
         self.setting_batch.pack(fill='x', pady=5)
         
         self.setting_adapt = SettingRow(train_section.content, "Adaptation Steps",
-                                        5, 1, 20)
+                                        5, 1, 20,
+                                        description="Inner-loop updates per task.\nMore = deeper adaptation,\nbut slower per round.")
         self.setting_adapt.pack(fill='x', pady=5)
         
         ckpt_frame = tk.Frame(train_section.content, bg=COLORS['bg_dark'])
         ckpt_frame.pack(fill='x', pady=5)
         
-        tk.Label(ckpt_frame, text="Checkpoint Dir",
+        ckpt_label = tk.Label(ckpt_frame, text="Checkpoint Dir",
                 font=('Segoe UI', 10),
                 fg=COLORS['text_primary'],
-                bg=COLORS['bg_dark']).pack(anchor='w')
+                bg=COLORS['bg_dark'],
+                cursor='hand2')
+        ckpt_label.pack(anchor='w')
+        self._ckpt_popup = None
+        ckpt_label.bind('<Button-1>', self._show_ckpt_desc)
         
         self.entry_checkpoint = tk.Entry(ckpt_frame,
                                         font=('Segoe UI', 10),
@@ -411,6 +462,34 @@ class TrainingGUI:
         self.entry_checkpoint.pack(fill='x', pady=(5, 0))
         self.entry_checkpoint.insert(0, "checkpoints")
     
+    def _show_ckpt_desc(self, event):
+        if self._ckpt_popup:
+            self._ckpt_popup.destroy()
+            self._ckpt_popup = None
+            return
+        self._ckpt_popup = tk.Toplevel(self.root)
+        self._ckpt_popup.overrideredirect(True)
+        self._ckpt_popup.configure(bg=COLORS['border'])
+        inner = tk.Frame(self._ckpt_popup, bg=COLORS['bg_card'], padx=1, pady=1)
+        inner.pack(fill='both', expand=True, padx=1, pady=1)
+        msg = tk.Label(inner, text="Folder to save the best model file.",
+                      font=('Segoe UI', 9),
+                      fg=COLORS['text_primary'],
+                      bg=COLORS['bg_card'],
+                      wraplength=280, justify='left',
+                      padx=12, pady=10)
+        msg.pack()
+        x = event.widget.winfo_rootx()
+        y = event.widget.winfo_rooty() + event.widget.winfo_height() + 4
+        self._ckpt_popup.geometry(f'+{x}+{y}')
+        self._ckpt_popup.after(5000, lambda: self._close_ckpt_popup())
+        self._ckpt_popup.bind('<Button-1>', lambda e: self._close_ckpt_popup())
+
+    def _close_ckpt_popup(self):
+        if self._ckpt_popup:
+            self._ckpt_popup.destroy()
+            self._ckpt_popup = None
+
     def _create_metric_cards(self, parent):
         cards_frame = tk.Frame(parent, bg=COLORS['bg_dark'])
         cards_frame.pack(fill='x', pady=(0, 10))
