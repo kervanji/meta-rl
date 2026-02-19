@@ -49,6 +49,7 @@ class WSNAbstractEnv(gym.Env):
         
         # تهيئة مستويات البطارية (موحدة بين [0,1])
         self.battery_levels = np.ones(self.num_nodes)
+        self.prev_transmit_power = np.zeros(self.num_nodes)
         
         # تهيئة اتصال الشبكة
         self.update_connectivity()
@@ -57,14 +58,25 @@ class WSNAbstractEnv(gym.Env):
         return self._get_observation()
     
     def update_connectivity(self) -> None:
-        """تحديث اتصال الشبكة بناءً على مواقع العقد ومدى الاتصال."""
-        self.connectivity = np.zeros((self.num_nodes, self.num_nodes))
-        for i in range(self.num_nodes):
-            for j in range(i+1, self.num_nodes):
-                distance = np.linalg.norm(self.node_positions[i] - self.node_positions[j])
-                if distance <= self.comm_range:
-                    self.connectivity[i,j] = 1
-                    self.connectivity[j,i] = 1
+        """تحديث اتصال الشبكة الثابت بناءً على مواقع العقد ومدى الاتصال الكامل (يُستخدم عند reset)."""
+        diff = self.node_positions[:, np.newaxis, :] - self.node_positions[np.newaxis, :, :]
+        dist = np.sqrt(np.sum(diff ** 2, axis=-1))
+        self.connectivity = (dist <= self.comm_range).astype(np.float32)
+        np.fill_diagonal(self.connectivity, 0)
+
+    def _update_dynamic_connectivity(self, transmit_power: np.ndarray, sleep_schedule: np.ndarray) -> None:
+        """تحديث اتصال الشبكة ديناميكياً بناءً على قوة الإرسال وجدول النوم."""
+        diff = self.node_positions[:, np.newaxis, :] - self.node_positions[np.newaxis, :, :]
+        dist = np.sqrt(np.sum(diff ** 2, axis=-1))
+
+        effective_range = self.comm_range * transmit_power
+        min_range = np.minimum(effective_range[:, np.newaxis], effective_range[np.newaxis, :])
+
+        awake = (sleep_schedule == 0).astype(np.float32)
+        awake_pair = awake[:, np.newaxis] * awake[np.newaxis, :]
+
+        self.connectivity = ((dist <= min_range) & (awake_pair > 0)).astype(np.float32)
+        np.fill_diagonal(self.connectivity, 0)
     
     def _get_observation(self) -> Dict:
         """الحصول على الملاحظة الحالية للبيئة."""
@@ -97,14 +109,21 @@ class WSNAbstractEnv(gym.Env):
         # تطبيق الإجراءات
         transmit_power = action['transmit_power']
         sleep_schedule = action['sleep_schedule']
+
+        # تحديث الاتصال الديناميكي بناءً على الإجراءات الجديدة
+        self._update_dynamic_connectivity(transmit_power, sleep_schedule)
+
+        # تحديث مستويات البطارية (نموذج واقعي)
+        awake_mask = (sleep_schedule == 0).astype(np.float32)
+        sleep_mask = 1.0 - awake_mask
+        idle_power = 0.01  # 1% من الاستهلاك الأساسي للعقد النائمة
+        self.battery_levels -= self.energy_consumption * (
+            awake_mask * transmit_power + sleep_mask * idle_power
+        )
         
-        # تحديث مستويات البطارية (نموذج مبسط)
-        for i in range(self.num_nodes):
-            if sleep_schedule[i] == 0:  # العقدة نشطة
-                self.battery_levels[i] -= self.energy_consumption * transmit_power[i]
-        
-        # حساب المكافأة (مبسط)
+        # حساب المكافأة
         reward = self._calculate_reward(transmit_power, sleep_schedule)
+        self.prev_transmit_power = transmit_power.copy()
         
         # تحديث عداد الخطوات
         self.current_step += 1
@@ -125,63 +144,118 @@ class WSNAbstractEnv(gym.Env):
     def _calculate_reward(self, transmit_power: np.ndarray, sleep_schedule: np.ndarray) -> float:
         """حساب المكافأة بناءً على الحالة الحالية والإجراءات المتخذة."""
         # ---------------------------------------------------------
-        # شرح مكونات المكافأة (Reward Components):
-        # 1. جودة الاتصال: كلما كانت العقد متصلة ببعضها زادت المكافأة.
-        # 2. كفاءة الطاقة: كلما استخدمنا قوة إرسال أقل زادت المكافأة.
-        # 3. كفاءة النوم: نكافئ العميل عندما ينجح في تنويم العقد غير الضرورية.
+        # مكونات المكافأة:
+        # 1. مكافأة الاتصال (وزن 0.5): نسبة العقد المستيقظة المتصلة + عقوبة على العقد المعزولة.
+        # 2. مكافأة الطاقة (وزن 0.4): مكافأة النوم وتخفيض قوة البث.
+        # 3. عقوبة موت العقد (تناسبية): تُخصم بنسبة العقد الميتة.
         # ---------------------------------------------------------
-        connectivity_score = np.sum(self.connectivity) / (self.num_nodes * (self.num_nodes - 1)) #جودة الاتصال
-        energy_efficiency = 1.0 - np.mean(transmit_power) #كفاءة الطاقة
-        battery_health = np.mean(self.battery_levels) # حماية البطارية
-        
-        # حساب المكافأة الأساسية الموزونة (بدون مكافأة النوم المباشرة)
+
+        awake_mask = (sleep_schedule == 0)  # True للعقد المستيقظة
+        num_awake = int(np.sum(awake_mask))
+
+        # --- مكافأة الاتصال ---
+        if num_awake == 0:
+            connectivity_reward = -1.0  # عقوبة قصوى إذا كانت كل الشبكة نائمة
+        else:
+            has_link = np.any(self.connectivity > 0, axis=1)  # (N,) bool
+            connected_awake = int(np.sum(has_link & awake_mask))
+            isolated_awake = num_awake - connected_awake
+
+            connectivity_ratio = connected_awake / num_awake
+            isolation_penalty = 2.0 * (isolated_awake / self.num_nodes)
+            connectivity_reward = connectivity_ratio - isolation_penalty
+
+        # --- مكافأة الطاقة ---
+        sleep_ratio = np.mean(sleep_schedule)          # نسبة العقد النائمة
+        power_saving = 1.0 - np.mean(transmit_power)   # توفير قوة البث
+        energy_reward = 0.6 * sleep_ratio + 0.4 * power_saving
+
+        # --- المكافأة الإجمالية الموزونة ---
         reward = (
-            0.5 * connectivity_score + # وزن جودة الاتصال
-            0.3 * energy_efficiency +  # وزن توفير الطاقة
-            0.2 * battery_health       # وزن حماية البطارية
+            0.5 * connectivity_reward +
+            0.4 * energy_reward
         )
 
-        # ==========================================
-        # عقوبة تناسبية لنفاد البطارية (Proportional Penalty):
-        # بدلاً من عقوبة ثابتة -5، نخصم بنسبة عدد العقد الميتة
-        # ==========================================
+        # --- عقوبة تناسبية لنفاد البطارية ---
         dead_nodes = np.sum(self.battery_levels <= 0)
         if dead_nodes > 0:
-            reward -= 5.0 * (dead_nodes / self.num_nodes)  # عقوبة تناسبية
-            
+            reward -= 5.0 * (dead_nodes / self.num_nodes)
+
         return reward
     
     # ==========================================
     # 6. العرض المرئي (Rendering)
     # لرسم خريطة الشبكة وتتبع الحالات بصرياً
     # ==========================================
-    def render(self, mode: str = 'human') -> None:
-        """عرض الحالة الحالية للبيئة."""
-        plt.figure(figsize=(8, 8))
+    def render(self, mode: str = 'human', sleep_schedule: np.ndarray = None,
+               transmit_power: np.ndarray = None) -> None:
+        """عرض الحالة الحالية للبيئة.
         
-        # رسم العقد
-        plt.scatter(self.node_positions[:, 0], self.node_positions[:, 1], 
-                   c='blue', s=100, label='Nodes')
-        
-        # رسم الاتصالات
+        ألوان العقد:
+          - أزرق  : مستيقظة ونشطة
+          - رمادي : نائمة (sleep_schedule == 1)
+          - أحمر  : ميتة (battery <= 0)
+        """
+        fig, ax = plt.subplots(figsize=(8, 8))
+        ax.set_facecolor('#1a1a2e')
+        fig.patch.set_facecolor('#1a1a2e')
+
+        # رسم الاتصالات أولاً (تحت العقد)
         for i in range(self.num_nodes):
             for j in range(i+1, self.num_nodes):
-                if self.connectivity[i,j] > 0:
-                    plt.plot([self.node_positions[i,0], self.node_positions[j,0]],
-                            [self.node_positions[i,1], self.node_positions[j,1]],
-                            'gray', alpha=0.5)
-        
-        plt.xlim(0, 1)
-        plt.ylim(0, 1)
-        plt.title('WSN Topology')
-        plt.xlabel('X Position')
-        plt.ylabel('Y Position')
-        plt.legend()
-        
+                if self.connectivity[i, j] > 0:
+                    lw = 1.5
+                    if transmit_power is not None:
+                        lw = 0.5 + 2.5 * float(min(transmit_power[i], transmit_power[j]))
+                    ax.plot(
+                        [self.node_positions[i, 0], self.node_positions[j, 0]],
+                        [self.node_positions[i, 1], self.node_positions[j, 1]],
+                        color='#4fc3f7', alpha=0.4, linewidth=lw
+                    )
+
+        # تصنيف العقد حسب الحالة
+        awake_idx, sleep_idx, dead_idx = [], [], []
+        for i in range(self.num_nodes):
+            if self.battery_levels[i] <= 0:
+                dead_idx.append(i)
+            elif sleep_schedule is not None and sleep_schedule[i] == 1:
+                sleep_idx.append(i)
+            else:
+                awake_idx.append(i)
+
+        def _scatter(indices, color, label, marker='o', size=120, alpha=1.0, zorder=3):
+            if indices:
+                idx = np.array(indices)
+                ax.scatter(self.node_positions[idx, 0], self.node_positions[idx, 1],
+                           c=color, s=size, label=label, marker=marker,
+                           alpha=alpha, zorder=zorder, edgecolors='white', linewidths=0.5)
+
+        _scatter(awake_idx,  '#29b6f6', f'Awake ({len(awake_idx)})')
+        _scatter(sleep_idx,  '#78909c', f'Sleeping ({len(sleep_idx)})', alpha=0.6)
+        _scatter(dead_idx,   '#ef5350', f'Dead ({len(dead_idx)})',   marker='x', size=140,
+                 alpha=1.0, zorder=4)
+
+        # عنوان يعرض إحصائيات سريعة
+        connected = int(np.sum(self.connectivity) / 2)
+        title = (f'WSN Topology  |  Awake: {len(awake_idx)}  '
+                 f'Sleeping: {len(sleep_idx)}  Dead: {len(dead_idx)}  '
+                 f'Links: {connected}')
+        ax.set_title(title, color='white', fontsize=10, pad=10)
+        ax.set_xlabel('X Position', color='#aaaaaa')
+        ax.set_ylabel('Y Position', color='#aaaaaa')
+        ax.tick_params(colors='#aaaaaa')
+        for spine in ax.spines.values():
+            spine.set_color('#333355')
+        ax.set_xlim(0, 1)
+        ax.set_ylim(0, 1)
+        legend = ax.legend(loc='upper right', fontsize=9,
+                           facecolor='#16213e', edgecolor='#333355', labelcolor='white')
+
+        plt.tight_layout()
         if mode == 'human':
             plt.show()
         else:
-            return plt.gcf()
+            return fig
 
 
 # ==========================================

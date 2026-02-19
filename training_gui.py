@@ -294,7 +294,9 @@ class TrainingGUI:
         self.current_delay = 0.0
         self.current_connectivity = 0.0
         self.initial_energy = None
+        self.min_energy = None
         self.initial_delay = None
+        self._energy_warmup_buf = []
         
         self.setup_styles()
         self.setup_ui()
@@ -461,6 +463,19 @@ class TrainingGUI:
                                         relief='flat')
         self.entry_checkpoint.pack(fill='x', pady=(5, 0))
         self.entry_checkpoint.insert(0, "checkpoints")
+
+        self.resume_var = tk.BooleanVar(value=False)
+        resume_cb = tk.Checkbutton(train_section.content,
+                                   text="Resume from checkpoint",
+                                   variable=self.resume_var,
+                                   font=('Segoe UI', 10),
+                                   fg=COLORS['text_primary'],
+                                   bg=COLORS['bg_dark'],
+                                   selectcolor=COLORS['bg_input'],
+                                   activebackground=COLORS['bg_dark'],
+                                   activeforeground=COLORS['text_primary'],
+                                   relief='flat', bd=0)
+        resume_cb.pack(anchor='w', pady=(8, 0))
     
     def _show_ckpt_desc(self, event):
         if self._ckpt_popup:
@@ -652,6 +667,12 @@ class TrainingGUI:
         self.canvas.draw()
         self.terminal_output.delete(1.0, tk.END)
         
+        # Reset baseline energy trackers for the new run
+        self.initial_energy = None
+        self.min_energy = None
+        self.initial_delay = None
+        self._energy_warmup_buf = []
+
         # Reset metric cards
         self.update_metric_cards(0.0, 0.0, 0.0, 0.0)
     
@@ -664,8 +685,13 @@ class TrainingGUI:
         if energy is not None:
             self.current_energy = energy
             self.card_energy.update_value(f"{energy:.5f}")
-            if self.initial_energy is None and energy > 0:
-                self.initial_energy = energy
+            if energy > 0:
+                if self.initial_energy is None:
+                    self._energy_warmup_buf.append(energy)
+                    if len(self._energy_warmup_buf) >= 20:
+                        self.initial_energy = float(np.mean(self._energy_warmup_buf))
+                if self.initial_energy is not None and (self.min_energy is None or energy < self.min_energy):
+                    self.min_energy = energy
         
         if delay is not None:
             self.current_delay = delay
@@ -680,8 +706,8 @@ class TrainingGUI:
         self._update_energy_delay_insight()
 
     def _update_energy_delay_insight(self):
-        if self.initial_energy:
-            change = ((self.initial_energy - self.current_energy) / self.initial_energy) * 100
+        if self.initial_energy and self.min_energy:
+            change = ((self.initial_energy - self.min_energy) / self.initial_energy) * 100
             self.energy_reduction_label.config(
                 text=f"Energy drop: {change:+.1f}%"
             )
@@ -734,7 +760,8 @@ class TrainingGUI:
                 'meta_iterations': meta_iterations,
                 'meta_batch': meta_batch,
                 'adaptation_steps': adaptation_steps,
-                'checkpoint_dir': self.entry_checkpoint.get()
+                'checkpoint_dir': self.entry_checkpoint.get(),
+                'resume': self.resume_var.get()
             }
         except ValueError as e:
             messagebox.showerror("Input Error", f"Invalid input values: {e}")
@@ -760,231 +787,43 @@ class TrainingGUI:
         self.root.after(100, self.check_output)
         
     def run_training(self, config):
-        # Create training script with custom config
-        script_path = os.path.join(os.path.dirname(__file__), "train_with_gui.py")
-        
-        # Write temporary training script
-        training_code = f'''
-import os
-import sys
-import traceback
+        script_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "train_with_gui.py")
 
-# Force unbuffered output
-os.environ['PYTHONUNBUFFERED'] = '1'
-sys.stdout.reconfigure(line_buffering=True)
+        cmd = [
+            sys.executable, '-u', script_path,
+            '--num_nodes',          str(config['num_nodes']),
+            '--comm_range',         str(config['comm_range']),
+            '--energy_consumption', str(config['energy_consumption']),
+            '--max_steps',          str(config['max_steps']),
+            '--meta_iterations',    str(config['meta_iterations']),
+            '--meta_batch',         str(config['meta_batch']),
+            '--adaptation_steps',   str(config['adaptation_steps']),
+            '--checkpoint_dir',     config['checkpoint_dir'],
+        ]
+        if config.get('resume'):
+            cmd.append('--resume')
 
-print("Initializing training script...", flush=True)
-
-try:
-    import torch
-    import numpy as np
-    import time
-    print("Libraries loaded successfully", flush=True)
-
-    # Add parent directory to path
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
-    from src.envs.wsn_env import WSNEnv
-    from src.networks.wsn_policy import WSNActorCritic
-    from src.agents.maml_agent import MAMLAgent
-    print("Modules imported successfully", flush=True)
-except Exception as e:
-    print(f"ERROR importing modules: {{e}}", flush=True)
-    traceback.print_exc()
-    sys.exit(1)
-
-def create_tasks(num_tasks, env_config):
-    tasks = []
-    for _ in range(num_tasks):
-        config = env_config.copy()
-        base = env_config['comm_range']
-        config['comm_range'] = np.random.uniform(
-            max(0.05, base - 0.05),
-            min(0.95, base + 0.05)
-        )
-        env = WSNEnv(config)
-        tasks.append(env)
-    return tasks
-
-def collect_rollout(env, policy, max_steps=None):
-    if max_steps is None:
-        max_steps = float('inf')
-    
-    states, actions, rewards, dones = [], [], [], []
-    state = env.reset()
-    done = False
-    step = 0
-    total_energy = 0
-    total_delay = 0
-    
-    while not done and step < max_steps:
-        action = policy.get_action(state)
-        next_state, reward, done, _ = env.step(action)
-        
-        # Calculate energy consumption (based on transmit power AND sleep schedule)
-        active_mask = 1 - action['sleep_schedule']  # 1 if active, 0 if sleeping
-        energy = env.energy_consumption * np.mean(active_mask * action['transmit_power'])
-        total_energy += energy
-        
-        # Calculate delay (simulated based on network connectivity and distance)
-        connectivity = np.sum(next_state['connectivity']) / (env.num_nodes * (env.num_nodes - 1))
-        delay = (1 - connectivity) * 100 + np.random.uniform(0, 3)  # ms (reduced noise)
-        total_delay += delay
-        
-        states.append(state)
-        actions.append(action)
-        rewards.append(reward)
-        dones.append(done)
-        
-        state = next_state
-        step += 1
-    
-    avg_energy = total_energy / max(step, 1)
-    avg_delay = total_delay / max(step, 1)
-    
-    states_stacked = {{
-        k: np.array([s[k] for s in states], dtype=np.float32)
-        for k in states[0].keys()
-    }}
-    return {{
-        'states': states_stacked,
-        'actions': {{k: np.array([a[k] for a in actions], dtype=np.float32) for k in actions[0].keys()}},
-        'rewards': np.array(rewards, dtype=np.float32),
-        'dones': np.array(dones, dtype=bool),
-        'avg_energy': avg_energy,
-        'avg_delay': avg_delay
-    }}
-
-def main():
-    torch.manual_seed(42)
-    np.random.seed(42)
-    
-    # Configuration from GUI
-    env_config = {{
-        'num_nodes': {config['num_nodes']},
-        'comm_range': {config['comm_range']},
-        'energy_consumption': {config['energy_consumption']},
-        'max_steps': {config['max_steps']}
-    }}
-    
-    num_meta_iterations = {config['meta_iterations']}
-    meta_batch_size = {config['meta_batch']}
-    num_adaptation_steps = {config['adaptation_steps']}
-    save_dir = '{config['checkpoint_dir']}'
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    
-    os.makedirs(save_dir, exist_ok=True)
-    
-    print(f"Starting training with {{env_config['num_nodes']}} nodes on {{device}}", flush=True)
-    print(f"Meta iterations: {{num_meta_iterations}}, Batch size: {{meta_batch_size}}", flush=True)
-    print("=" * 60, flush=True)
-    
-    sample_env = WSNEnv(env_config)
-    obs_space = sample_env.observation_space
-    act_space = sample_env.action_space
-    
-    state_dim = (
-        obs_space['node_positions'].shape[0] * obs_space['node_positions'].shape[1] +
-        obs_space['battery_levels'].shape[0] +
-        (obs_space['connectivity'].shape[0] * (obs_space['connectivity'].shape[0] - 1)) // 2
-    )
-    
-    action_dims = {{
-        'transmit_power': act_space['transmit_power'].shape[0],
-        'sleep_schedule': act_space['sleep_schedule'].n
-    }}
-    
-    policy = WSNActorCritic(state_dim, action_dims).to(device)
-    
-    agent = MAMLAgent(
-        policy_network=policy,
-        inner_lr=1e-3,
-        meta_lr=1e-4,
-        num_updates=num_adaptation_steps,
-        device=device
-    )
-    
-    best_avg_reward = -float('inf')
-    
-    for meta_iter in range(num_meta_iterations):
-        tasks = create_tasks(meta_batch_size, env_config)
-        
-        task_data = []
-        total_energy = 0
-        total_delay = 0
-        
-        for task in tasks:
-            rollout = collect_rollout(task, policy, env_config['max_steps'])
-            task_data.append(rollout)
-            total_energy += rollout['avg_energy']
-            total_delay += rollout['avg_delay']
-        
-        avg_energy = total_energy / meta_batch_size
-        avg_delay = total_delay / meta_batch_size
-        
-        meta_loss = agent.meta_update(task_data)
-        
-        # Calculate connectivity
-        eval_env = WSNEnv(env_config)
-        eval_state = eval_env.reset()
-        connectivity = np.sum(eval_state['connectivity']) / (env_config['num_nodes'] * (env_config['num_nodes'] - 1)) * 100
-        
-        # Print metrics for GUI parsing
-        progress = ((meta_iter + 1) / num_meta_iterations) * 100
-        print(f"METRICS|{{meta_iter + 1}}|{{avg_energy:.6f}}|{{avg_delay:.2f}}|{{progress:.1f}}|{{connectivity:.1f}}", flush=True)
-        
-        if (meta_iter + 1) % 10 == 0:
-            eval_rollout = collect_rollout(eval_env, policy, env_config['max_steps'])
-            avg_reward = np.mean(eval_rollout['rewards'])
-            
-            print(f"Round {{meta_iter + 1}}: Loss={{meta_loss:.6f}}, Reward={{avg_reward:.3f}}, Energy={{avg_energy:.6f}}, Delay={{avg_delay:.2f}}ms", flush=True)
-            print(f"REWARD|{{avg_reward:.3f}}", flush=True)
-            
-            if avg_reward > best_avg_reward:
-                best_avg_reward = avg_reward
-                save_path = os.path.join(save_dir, 'best_model.pt')
-                agent.save(save_path)
-                print(f"New best model saved! Reward: {{avg_reward:.3f}}", flush=True)
-    
-    print("=" * 60, flush=True)
-    print("=== Training finished ===", flush=True)
-
-if __name__ == "__main__":
-    try:
-        main()
-    except Exception as e:
-        print(f"ERROR in main: {{e}}", flush=True)
-        traceback.print_exc()
-        sys.exit(1)
-
-'''
-        
-        with open(script_path, 'w', encoding='utf-8') as f:
-            f.write(training_code)
-        
         try:
-            # Run training script with unbuffered output
             env = os.environ.copy()
             env['PYTHONUNBUFFERED'] = '1'
-            
+
             self.training_process = subprocess.Popen(
-                [sys.executable, '-u', script_path],
+                cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
                 bufsize=1,
-                cwd=os.path.dirname(__file__),
+                cwd=os.path.dirname(os.path.abspath(__file__)),
                 env=env
             )
-            
-            # Read output line by line
+
             for line in iter(self.training_process.stdout.readline, ''):
                 if not self.is_training:
                     break
                 self.output_queue.put(line)
-                
+
             self.training_process.wait()
-            
+
         except Exception as e:
             self.output_queue.put(f"Error: {str(e)}\n")
         finally:
