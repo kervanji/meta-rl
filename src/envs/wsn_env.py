@@ -1,5 +1,4 @@
 import numpy as np
-import networkx as nx
 import gymnasium as gym
 from gymnasium import spaces
 from typing import Dict, List, Tuple, Optional
