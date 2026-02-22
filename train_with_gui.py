@@ -43,7 +43,6 @@ def collect_rollout(env, policy, max_steps=None, deterministic=True):
     if max_steps is None:
         max_steps = 200
 
-    # تخصيص مصفوفات مسبقاً بدلاً من قوائم Python (أسرع بكثير)
     N = env.num_nodes
     states_pos = np.empty((max_steps, N, 2), dtype=np.float32)
     states_bat = np.empty((max_steps, N), dtype=np.float32)
