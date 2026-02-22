@@ -173,15 +173,20 @@ class MAMLAgent:
                 
             return action_dict
     
-    def save(self, path: str) -> None:
+    def save(self, path: str, meta_iter: int = 0, best_avg_reward: float = -float('inf')) -> None:
         """حفظ نموذج العميل."""
         torch.save({
             'policy_state_dict': self.policy.state_dict(),
             'optimizer_state_dict': self.meta_optimizer.state_dict(),
+            'meta_iter': meta_iter,
+            'best_avg_reward': best_avg_reward,
         }, path)
     
-    def load(self, path: str) -> None:
-        """تحميل نموذج العميل."""
+    def load(self, path: str):
+        """تحميل نموذج العميل. يُرجع (start_iter, best_avg_reward) للاستئناف الصحيح."""
         checkpoint = torch.load(path, map_location=self.device)
         self.policy.load_state_dict(checkpoint['policy_state_dict'])
         self.meta_optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        start_iter = checkpoint.get('meta_iter', 0)
+        best_avg_reward = checkpoint.get('best_avg_reward', -float('inf'))
+        return start_iter, best_avg_reward

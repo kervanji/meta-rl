@@ -272,8 +272,8 @@ class TrainingGUI:
     def __init__(self, root):
         self.root = root
         self.root.title("Meta-RL WSN Trainer")
-        self.root.geometry("1200x800")
-        self.root.minsize(1100, 750)
+        self.root.geometry("1500x850")
+        self.root.minsize(1400, 800)
         self.root.configure(bg=COLORS['bg_dark'])
         
         # Data storage for charts
@@ -297,6 +297,17 @@ class TrainingGUI:
         self.min_energy = None
         self.initial_delay = None
         self._energy_warmup_buf = []
+
+        # WSN Topology state
+        self._wsn_positions = None   # (N, 2) مواقع العقد
+        self._wsn_states = None      # قائمة نصوص 'A'/'S'/'D'
+        self._wsn_n_awake = 0
+        self._wsn_n_sleep = 0
+        self._wsn_n_dead = 0
+        self._wsn_n_links = 0
+        self._wsn_history_awake = []
+        self._wsn_history_sleep = []
+        self._wsn_history_dead  = []
         
         self.setup_styles()
         self.setup_ui()
@@ -318,6 +329,15 @@ class TrainingGUI:
                        fieldbackground=COLORS['bg_input'],
                        foreground=COLORS['text_primary'],
                        insertcolor=COLORS['text_primary'])
+        
+        style.configure('Dark.TCombobox',
+                       fieldbackground=COLORS['bg_input'],
+                       foreground=COLORS['text_primary'],
+                       background=COLORS['bg_input'])
+        
+        style.map('Dark.TCombobox',
+                 fieldbackground=[('readonly', COLORS['bg_input'])],
+                 foreground=[('readonly', COLORS['text_primary'])])
         
         style.configure('TScale',
                        background=COLORS['accent_blue'],
@@ -360,11 +380,14 @@ class TrainingGUI:
                         bg=COLORS['bg_dark'])
         title.pack(side='left', anchor='w')
         
-        subtitle = tk.Label(left, text="Nodes • Range • Steps • Device",
-                           font=('Segoe UI', 9),
-                           fg=COLORS['text_secondary'],
+        self.device_info_label = tk.Label(left, text="Detecting Hardware...",
+                           font=('Segoe UI', 9, 'bold'),
+                           fg=COLORS['accent_cyan'],
                            bg=COLORS['bg_dark'])
-        subtitle.pack(side='left', padx=(15, 0), anchor='s', pady=(0, 5))
+        self.device_info_label.pack(side='left', padx=(15, 0), anchor='s', pady=(0, 5))
+        
+        # Initial device detection
+        self.root.after(500, self._detect_device)
         
         right = tk.Frame(header, bg=COLORS['bg_dark'])
         right.pack(side='right', fill='y')
@@ -412,7 +435,7 @@ class TrainingGUI:
         
         self.setting_range = SettingRow(net_section.content, "Communication Range",
                                         0.15, 0.05, 0.5, is_float=True,
-                                        description="Max distance nodes can talk.\nLow = weak links, harder task.\nHigh = strong links, easier task.")
+                                        description="Max distance nodes can talk.\nLow = weak links but less energy.\nHigh = strong links but more energy.")
         self.setting_range.pack(fill='x', pady=5)
         
         self.setting_energy = SettingRow(net_section.content, "Energy Consumption",
@@ -440,7 +463,7 @@ class TrainingGUI:
         
         self.setting_adapt = SettingRow(train_section.content, "Adaptation Steps",
                                         5, 1, 20,
-                                        description="Inner-loop updates per task.\nMore = deeper adaptation,\nbut slower per round.")
+                                        description="Inner-loop updates per task.\nMore = faster adaptation and better\nenergy efficiency per task environment.")
         self.setting_adapt.pack(fill='x', pady=5)
         
         ckpt_frame = tk.Frame(train_section.content, bg=COLORS['bg_dark'])
@@ -476,6 +499,31 @@ class TrainingGUI:
                                    activeforeground=COLORS['text_primary'],
                                    relief='flat', bd=0)
         resume_cb.pack(anchor='w', pady=(8, 0))
+
+        # Hardware Acceleration Section
+        hw_section = CollapsibleSection(sidebar, "Hardware Acceleration", icon='🚀')
+        hw_section.pack(fill='x', pady=(0, 20))
+
+        tk.Label(hw_section.content, text="Compute Device",
+                 font=('Segoe UI', 10),
+                 fg=COLORS['text_primary'],
+                 bg=COLORS['bg_dark']).pack(anchor='w')
+
+        self.device_var = tk.StringVar(value='auto')
+        self.device_combo = ttk.Combobox(hw_section.content, 
+                                        textvariable=self.device_var,
+                                        values=('auto', 'cuda', 'cpu'),
+                                        state='readonly',
+                                        style='Dark.TCombobox')
+        self.device_combo.pack(fill='x', pady=(5, 0))
+        
+        device_desc = tk.Label(hw_section.content, 
+                              text="GPU (CUDA) is highly recommended for faster training.",
+                              font=('Segoe UI', 8),
+                              fg=COLORS['text_secondary'],
+                              bg=COLORS['bg_dark'],
+                              wraplength=220, justify='left')
+        device_desc.pack(anchor='w', pady=(5, 0))
     
     def _show_ckpt_desc(self, event):
         if self._ckpt_popup:
@@ -504,6 +552,17 @@ class TrainingGUI:
         if self._ckpt_popup:
             self._ckpt_popup.destroy()
             self._ckpt_popup = None
+
+    def _detect_device(self):
+        try:
+            import torch
+            if torch.cuda.is_available():
+                name = torch.cuda.get_device_name(0)
+                self.device_info_label.config(text=f"🚀 GPU: {name}", fg=COLORS['accent_green'])
+            else:
+                self.device_info_label.config(text="💻 CPU Mode", fg=COLORS['accent_orange'])
+        except ImportError:
+            self.device_info_label.config(text="PyTorch not found", fg='#ef4444')
 
     def _create_metric_cards(self, parent):
         cards_frame = tk.Frame(parent, bg=COLORS['bg_dark'])
@@ -600,15 +659,18 @@ class TrainingGUI:
         self.terminal_output.tag_configure('red', foreground='#ef4444')
         
     def setup_charts(self):
-        self.fig = Figure(figsize=(10, 4), dpi=100, facecolor=COLORS['bg_card'])
+        # ======================================================
+        # الجزء العلوي: رسومات الطاقة والتأخير
+        # ======================================================
+        self.fig = Figure(figsize=(10, 3.5), dpi=100, facecolor=COLORS['bg_card'])
         
         self.ax_energy = self.fig.add_subplot(121)
         self.ax_energy.set_facecolor(COLORS['chart_bg'])
         self.ax_energy.set_title("Energy Consumption vs Round", 
-                                 fontsize=11, fontweight='bold', color=COLORS['text_primary'])
-        self.ax_energy.set_xlabel("Round (Episode)", color=COLORS['text_secondary'])
-        self.ax_energy.set_ylabel("Energy Consumption", color=COLORS['text_secondary'])
-        self.ax_energy.tick_params(colors=COLORS['text_secondary'])
+                                 fontsize=10, fontweight='bold', color=COLORS['text_primary'])
+        self.ax_energy.set_xlabel("Round (Episode)", color=COLORS['text_secondary'], fontsize=8)
+        self.ax_energy.set_ylabel("Energy Consumption", color=COLORS['text_secondary'], fontsize=8)
+        self.ax_energy.tick_params(colors=COLORS['text_secondary'], labelsize=7)
         self.ax_energy.grid(True, linestyle='--', alpha=0.3, color=COLORS['border'])
         for spine in self.ax_energy.spines.values():
             spine.set_color(COLORS['border'])
@@ -618,24 +680,77 @@ class TrainingGUI:
         self.ax_delay = self.fig.add_subplot(122)
         self.ax_delay.set_facecolor(COLORS['chart_bg'])
         self.ax_delay.set_title("Delay vs Round", 
-                                fontsize=11, fontweight='bold', color=COLORS['text_primary'])
-        self.ax_delay.set_xlabel("Round (Episode)", color=COLORS['text_secondary'])
-        self.ax_delay.set_ylabel("Delay (ms)", color=COLORS['text_secondary'])
-        self.ax_delay.tick_params(colors=COLORS['text_secondary'])
+                                fontsize=10, fontweight='bold', color=COLORS['text_primary'])
+        self.ax_delay.set_xlabel("Round (Episode)", color=COLORS['text_secondary'], fontsize=8)
+        self.ax_delay.set_ylabel("Delay (ms)", color=COLORS['text_secondary'], fontsize=8)
+        self.ax_delay.tick_params(colors=COLORS['text_secondary'], labelsize=7)
         self.ax_delay.grid(True, linestyle='--', alpha=0.3, color=COLORS['border'])
         for spine in self.ax_delay.spines.values():
             spine.set_color(COLORS['border'])
         self.line_delay, = self.ax_delay.plot([], [], color=COLORS['accent_orange'], 
                                                linewidth=1)
         
-        self.fig.tight_layout(pad=2)
+        self.fig.tight_layout(pad=1.5)
         
         self.canvas = FigureCanvasTkAgg(self.fig, master=self.charts_frame)
         self.canvas.draw()
-        self.canvas.get_tk_widget().pack(fill='both', expand=True, padx=5, pady=5)
+        self.canvas.get_tk_widget().pack(fill='both', expand=True, padx=5, pady=(5, 2))
+
+        # ======================================================
+        # الجزء السفلي: طبولوجيا الشبكة + مخطط تطور العقد
+        # ======================================================
+        self.topo_frame = tk.Frame(self.charts_frame, bg=COLORS['bg_card'])
+        self.topo_frame.pack(fill='both', expand=True, padx=5, pady=(0, 5))
+
+        # --- رسم الطبولوجيا (يسار) ---
+        self.fig_topo = Figure(figsize=(4.5, 4), dpi=90, facecolor='#1a1a2e')
+        self.ax_topo = self.fig_topo.add_subplot(111)
+        self.ax_topo.set_facecolor('#1a1a2e')
+        self.ax_topo.set_title("WSN Topology — Waiting for data...",
+                               color='white', fontsize=9, pad=6)
+        self.ax_topo.set_xlabel('X', color='#aaaaaa', fontsize=7)
+        self.ax_topo.set_ylabel('Y', color='#aaaaaa', fontsize=7)
+        self.ax_topo.tick_params(colors='#aaaaaa', labelsize=6)
+        for sp in self.ax_topo.spines.values():
+            sp.set_color('#333355')
+        self.ax_topo.set_xlim(0, 1)
+        self.ax_topo.set_ylim(0, 1)
+        self.fig_topo.tight_layout(pad=1)
+
+        self.canvas_topo = FigureCanvasTkAgg(self.fig_topo, master=self.topo_frame)
+        self.canvas_topo.draw()
+        self.canvas_topo.get_tk_widget().pack(side='left', fill='both', expand=True)
+
+        # --- مخطط تطور العقد عبر الزمن (يمين) ---
+        self.fig_hist = Figure(figsize=(5, 4), dpi=90, facecolor=COLORS['bg_card'])
+        self.ax_hist = self.fig_hist.add_subplot(111)
+        self.ax_hist.set_facecolor(COLORS['chart_bg'])
+        self.ax_hist.set_title("Node States Over Time",
+                               fontsize=10, fontweight='bold', color=COLORS['text_primary'])
+        self.ax_hist.set_xlabel("Round", color=COLORS['text_secondary'], fontsize=8)
+        self.ax_hist.set_ylabel("# Nodes", color=COLORS['text_secondary'], fontsize=8)
+        self.ax_hist.tick_params(colors=COLORS['text_secondary'], labelsize=7)
+        self.ax_hist.grid(True, linestyle='--', alpha=0.3, color=COLORS['border'])
+        for sp in self.ax_hist.spines.values():
+            sp.set_color(COLORS['border'])
+        self.line_awake, = self.ax_hist.plot([], [], color='#29b6f6', linewidth=2, label='Awake')
+        self.line_sleep, = self.ax_hist.plot([], [], color='#78909c', linewidth=2, label='Sleeping')
+        self.line_dead,  = self.ax_hist.plot([], [], color='#ef5350', linewidth=2, label='Dead')
+        self.ax_hist.legend(loc='upper right', fontsize=8,
+                            facecolor=COLORS['chart_bg'], edgecolor=COLORS['border'],
+                            labelcolor=COLORS['text_primary'])
+        self.fig_hist.tight_layout(pad=1.5)
+
+        self.canvas_hist = FigureCanvasTkAgg(self.fig_hist, master=self.topo_frame)
+        self.canvas_hist.draw()
+        self.canvas_hist.get_tk_widget().pack(side='left', fill='both', expand=True)
         
     def update_charts(self, round_num, energy, delay):
-        self.rounds.append(round_num)
+        # تطبيع رقم الجولة ليبدأ من 1 دائماً (مهم عند الاستئناف)
+        if not hasattr(self, '_round_offset') or self._round_offset is None:
+            self._round_offset = round_num - 1  # أول قيمة = 1 دائماً
+        display_round = round_num - self._round_offset
+        self.rounds.append(display_round)
         self.energy_data.append(energy)
         self.delay_data.append(delay)
         
@@ -651,6 +766,70 @@ class TrainingGUI:
         
         self.canvas.draw()
         
+    def update_wsn_topology(self, n_awake, n_sleep, n_dead, n_links, positions, states):
+        """تحديث رسم طبولوجيا الشبكة ومخطط تطور العقد."""
+        self._wsn_n_awake = n_awake
+        self._wsn_n_sleep = n_sleep
+        self._wsn_n_dead  = n_dead
+        self._wsn_n_links = n_links
+        self._wsn_positions = positions
+        self._wsn_states = states
+
+        # --- تحديث رسم الطبولوجيا ---
+        self.ax_topo.cla()
+        self.ax_topo.set_facecolor('#1a1a2e')
+        self.ax_topo.set_xlim(0, 1)
+        self.ax_topo.set_ylim(0, 1)
+        self.ax_topo.tick_params(colors='#aaaaaa', labelsize=6)
+        self.ax_topo.set_xlabel('X', color='#aaaaaa', fontsize=7)
+        self.ax_topo.set_ylabel('Y', color='#aaaaaa', fontsize=7)
+        for sp in self.ax_topo.spines.values():
+            sp.set_color('#333355')
+
+        if positions is not None and len(positions) > 0:
+            pos = np.array(positions)
+            awake_idx = [i for i, s in enumerate(states) if s == 'A']
+            sleep_idx = [i for i, s in enumerate(states) if s == 'S']
+            dead_idx  = [i for i, s in enumerate(states) if s == 'D']
+
+            if awake_idx:
+                ax = pos[awake_idx]
+                self.ax_topo.scatter(ax[:, 0], ax[:, 1],
+                                     c='#29b6f6', s=30, label=f'Awake ({n_awake})',
+                                     alpha=0.9, zorder=3, edgecolors='white', linewidths=0.3)
+            if sleep_idx:
+                sx = pos[sleep_idx]
+                self.ax_topo.scatter(sx[:, 0], sx[:, 1],
+                                     c='#78909c', s=25, label=f'Sleeping ({n_sleep})',
+                                     alpha=0.6, zorder=2, edgecolors='#aaaaaa', linewidths=0.2)
+            if dead_idx:
+                dx = pos[dead_idx]
+                self.ax_topo.scatter(dx[:, 0], dx[:, 1],
+                                     c='#ef5350', s=40, marker='x',
+                                     label=f'Dead ({n_dead})', alpha=1.0, zorder=4)
+
+        title = (f'WSN Topology  |  [A] Awake: {n_awake}  '
+                 f'[S] Sleeping: {n_sleep}  [D] Dead: {n_dead}  '
+                 f'Links: {n_links}')
+        self.ax_topo.set_title(title, color='white', fontsize=8, pad=5)
+        self.ax_topo.legend(loc='upper right', fontsize=7,
+                            facecolor='#16213e', edgecolor='#333355',
+                            labelcolor='white')
+        self.fig_topo.tight_layout(pad=0.8)
+        self.canvas_topo.draw()
+
+        # --- تحديث مخطط تطور العقد ---
+        self._wsn_history_awake.append(n_awake)
+        self._wsn_history_sleep.append(n_sleep)
+        self._wsn_history_dead.append(n_dead)
+        xs = list(range(1, len(self._wsn_history_awake) + 1))
+        self.line_awake.set_data(xs, self._wsn_history_awake)
+        self.line_sleep.set_data(xs, self._wsn_history_sleep)
+        self.line_dead.set_data(xs, self._wsn_history_dead)
+        self.ax_hist.relim()
+        self.ax_hist.autoscale_view()
+        self.canvas_hist.draw()
+
     def clear_charts(self):
         self.rounds = []
         self.energy_data = []
@@ -666,12 +845,35 @@ class TrainingGUI:
         
         self.canvas.draw()
         self.terminal_output.delete(1.0, tk.END)
+
+        # إعادة تعيين بيانات الطبولوجيا
+        self._wsn_history_awake = []
+        self._wsn_history_sleep = []
+        self._wsn_history_dead  = []
+        self._wsn_positions = None
+        self._wsn_states = None
+        self.ax_topo.cla()
+        self.ax_topo.set_facecolor('#1a1a2e')
+        self.ax_topo.set_xlim(0, 1)
+        self.ax_topo.set_ylim(0, 1)
+        self.ax_topo.set_title("WSN Topology — Waiting for data...",
+                               color='white', fontsize=9, pad=6)
+        self.canvas_topo.draw()
+        self.line_awake.set_data([], [])
+        self.line_sleep.set_data([], [])
+        self.line_dead.set_data([], [])
+        self.ax_hist.relim()
+        self.ax_hist.autoscale_view()
+        self.canvas_hist.draw()
         
         # Reset baseline energy trackers for the new run
         self.initial_energy = None
         self.min_energy = None
         self.initial_delay = None
         self._energy_warmup_buf = []
+
+        # Reset round offset so chart always starts from 1
+        self._round_offset = None
 
         # Reset metric cards
         self.update_metric_cards(0.0, 0.0, 0.0, 0.0)
@@ -761,7 +963,8 @@ class TrainingGUI:
                 'meta_batch': meta_batch,
                 'adaptation_steps': adaptation_steps,
                 'checkpoint_dir': self.entry_checkpoint.get(),
-                'resume': self.resume_var.get()
+                'resume': self.resume_var.get(),
+                'device': self.device_var.get()
             }
         except ValueError as e:
             messagebox.showerror("Input Error", f"Invalid input values: {e}")
@@ -771,7 +974,17 @@ class TrainingGUI:
         config = self.validate_inputs()
         if config is None:
             return
-            
+
+        # إذا لم يكن الاستئناف مفعّلاً، نمسح الـ checkpoint القديم حتى يبدأ التدريب من الصفر بالقيم الجديدة
+        if not config.get('resume'):
+            ckpt_path = os.path.join(config['checkpoint_dir'], 'best_model.pt')
+            if os.path.exists(ckpt_path):
+                try:
+                    os.remove(ckpt_path)
+                    print(f"[GUI] Deleted old checkpoint: {ckpt_path}", flush=True)
+                except Exception as e:
+                    print(f"[GUI] Warning: could not delete checkpoint: {e}", flush=True)
+
         self.is_training = True
         self.btn_start.set_enabled(False)
         self.btn_stop.set_enabled(True)
@@ -799,6 +1012,7 @@ class TrainingGUI:
             '--meta_batch',         str(config['meta_batch']),
             '--adaptation_steps',   str(config['adaptation_steps']),
             '--checkpoint_dir',     config['checkpoint_dir'],
+            '--device',             config['device'],
         ]
         if config.get('resume'):
             cmd.append('--resume')
@@ -851,6 +1065,25 @@ class TrainingGUI:
                         self.update_charts(round_num, energy, delay)
                         self.update_metric_cards(energy=energy, delay=delay, 
                                                 connectivity=connectivity)
+                elif line.startswith("WSN_STATE|"):
+                    # WSN_STATE|n_awake|n_sleep|n_dead|n_links|pos_str|state_str
+                    parts = line.strip().split("|")
+                    if len(parts) >= 7:
+                        try:
+                            n_awake = int(parts[1])
+                            n_sleep = int(parts[2])
+                            n_dead  = int(parts[3])
+                            n_links = int(parts[4])
+                            # تحليل المواقع: x0,y0,x1,y1,...
+                            coords = list(map(float, parts[5].split(',')))
+                            positions = [(coords[i], coords[i+1])
+                                         for i in range(0, len(coords), 2)]
+                            # تحليل الحالات: سلسلة نصية AASDAD...
+                            states = list(parts[6].strip())
+                            self.update_wsn_topology(n_awake, n_sleep, n_dead,
+                                                     n_links, positions, states)
+                        except Exception:
+                            pass
                 elif line.startswith("REWARD|"):
                     parts = line.strip().split("|")
                     if len(parts) >= 2:

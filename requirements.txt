@@ -6,6 +6,9 @@ matplotlib>=3.5.0
 # RL/ML
 gymnasium>=0.28.1
 
+# GPU Acceleration
+cupy-cuda12x>=13.0.0   # GPU array operations via CUDA (requires CUDA 12.x + cuDNN)
+
 # Utils
 tqdm>=4.62.0
 arabic-reshaper>=3.0.0

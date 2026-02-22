@@ -37,6 +37,8 @@ class WSNActorCritic(nn.Module):
         """
         super(WSNActorCritic, self).__init__()
         self.device = device
+        self._num_nodes = None  # سيُحدَّد عند أول forward
+        self._triu_indices = None  # مؤشرات المثلث العلوي (تُحسب مرة واحدة)
         
         # مستخرج سمات مشترك (Shared feature extractor)
         self.shared_layers = nn.ModuleList()
@@ -71,7 +73,7 @@ class WSNActorCritic(nn.Module):
         
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
-            nn.init.orthogonal_(m.weight, gain=0.01)
+            nn.init.orthogonal_(m.weight, gain=1.0)
             if m.bias is not None:
                 nn.init.constant_(m.bias, 0)
     
@@ -94,9 +96,11 @@ class WSNActorCritic(nn.Module):
         batch_size = node_positions.size(0)
         num_nodes = node_positions.size(1)
         
-        # تسطيح مصفوفة الاتصال (المثلث العلوي لتجنب التكرار)
-        triu_indices = torch.triu_indices(num_nodes, num_nodes, offset=1)
-        connectivity_flat = connectivity[:, triu_indices[0], triu_indices[1]]
+        # حساب triu_indices مرة واحدة وتخزينها (تحسين الأداء)
+        if self._triu_indices is None or self._num_nodes != num_nodes:
+            self._num_nodes = num_nodes
+            self._triu_indices = torch.triu_indices(num_nodes, num_nodes, offset=1, device=self.device)
+        connectivity_flat = connectivity[:, self._triu_indices[0], self._triu_indices[1]]
         
         # دمج جميع مكونات الحالة
         x = torch.cat([
@@ -130,7 +134,7 @@ class WSNActorCritic(nn.Module):
         المخرجات:
             action_dict: قاموس يحتوي على مصفوفات numpy للإجراءات
         """
-        self.eval()
+        # لا نستدعي self.eval() هنا لأن ذلك بطيء جداً عند استدعائه آلاف المرات
         with torch.no_grad():
             # تحويل إلى tensor
             state_tensor = {}

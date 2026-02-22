@@ -51,6 +51,10 @@ class WSNAbstractEnv(gym.Env):
         self.battery_levels = np.ones(self.num_nodes)
         self.prev_transmit_power = np.zeros(self.num_nodes)
         
+        # حساب مصفوفة المسافات مرة واحدة (المواقع ثابتة داخل الحلقة)
+        diff = self.node_positions[:, np.newaxis, :] - self.node_positions[np.newaxis, :, :]
+        self._dist_matrix = np.sqrt(np.sum(diff ** 2, axis=-1))
+        
         # تهيئة اتصال الشبكة
         self.update_connectivity()
         
@@ -59,15 +63,19 @@ class WSNAbstractEnv(gym.Env):
     
     def update_connectivity(self) -> None:
         """تحديث اتصال الشبكة الثابت بناءً على مواقع العقد ومدى الاتصال الكامل (يُستخدم عند reset)."""
-        diff = self.node_positions[:, np.newaxis, :] - self.node_positions[np.newaxis, :, :]
-        dist = np.sqrt(np.sum(diff ** 2, axis=-1))
+        # استخدام المصفوفة المخزنة إن وُجدت
+        if hasattr(self, '_dist_matrix'):
+            dist = self._dist_matrix
+        else:
+            diff = self.node_positions[:, np.newaxis, :] - self.node_positions[np.newaxis, :, :]
+            dist = np.sqrt(np.sum(diff ** 2, axis=-1))
         self.connectivity = (dist <= self.comm_range).astype(np.float32)
         np.fill_diagonal(self.connectivity, 0)
 
     def _update_dynamic_connectivity(self, transmit_power: np.ndarray, sleep_schedule: np.ndarray) -> None:
         """تحديث اتصال الشبكة ديناميكياً بناءً على قوة الإرسال وجدول النوم."""
-        diff = self.node_positions[:, np.newaxis, :] - self.node_positions[np.newaxis, :, :]
-        dist = np.sqrt(np.sum(diff ** 2, axis=-1))
+        # استخدام مصفوفة المسافات المخزنة (لا حاجة لإعادة الحساب)
+        dist = self._dist_matrix
 
         effective_range = self.comm_range * transmit_power
         min_range = np.minimum(effective_range[:, np.newaxis], effective_range[np.newaxis, :])
@@ -117,7 +125,8 @@ class WSNAbstractEnv(gym.Env):
         awake_mask = (sleep_schedule == 0).astype(np.float32)
         sleep_mask = 1.0 - awake_mask
         idle_power = 0.01  # 1% من الاستهلاك الأساسي للعقد النائمة
-        self.battery_levels -= self.energy_consumption * (
+        range_factor = self.comm_range  # مدى أكبر = طاقة أكثر، مدى أقصر = طاقة أقل
+        self.battery_levels -= self.energy_consumption * range_factor * (
             awake_mask * transmit_power + sleep_mask * idle_power
         )
         
@@ -145,9 +154,10 @@ class WSNAbstractEnv(gym.Env):
         """حساب المكافأة بناءً على الحالة الحالية والإجراءات المتخذة."""
         # ---------------------------------------------------------
         # مكونات المكافأة:
-        # 1. مكافأة الاتصال (وزن 0.5): نسبة العقد المستيقظة المتصلة + عقوبة على العقد المعزولة.
+        # 1. مكافأة الاتصال (وزن 0.5): نسبة العقد المستيقظة المتصلة
+        #    مع عقوبة طفيفة على العزل.
         # 2. مكافأة الطاقة (وزن 0.4): مكافأة النوم وتخفيض قوة البث.
-        # 3. عقوبة موت العقد (تناسبية): تُخصم بنسبة العقد الميتة.
+        # 3. عقوبة تناسبية لعقد ميتة (مخففة).
         # ---------------------------------------------------------
 
         awake_mask = (sleep_schedule == 0)  # True للعقد المستيقظة
@@ -161,27 +171,29 @@ class WSNAbstractEnv(gym.Env):
             connected_awake = int(np.sum(has_link & awake_mask))
             isolated_awake = num_awake - connected_awake
 
-            connectivity_ratio = connected_awake / num_awake
-            isolation_penalty = 2.0 * (isolated_awake / self.num_nodes)
-            connectivity_reward = connectivity_ratio - isolation_penalty
+            connectivity_ratio = connected_awake / num_awake  # [0, 1]
+            # عقوبة معتدلة على العزل (0.5 بدلاً من 2.0)
+            isolation_penalty = 0.5 * (isolated_awake / max(num_awake, 1))
+            connectivity_reward = connectivity_ratio - isolation_penalty  # [-0.5, 1]
 
         # --- مكافأة الطاقة ---
-        sleep_ratio = np.mean(sleep_schedule)          # نسبة العقد النائمة
-        power_saving = 1.0 - np.mean(transmit_power)   # توفير قوة البث
-        energy_reward = 0.6 * sleep_ratio + 0.4 * power_saving
+        sleep_ratio = np.mean(sleep_schedule)          # نسبة العقد النائمة [0, 1]
+        power_saving = 1.0 - np.mean(transmit_power)   # توفير قوة البث [0, 1]
+        energy_reward = 0.5 * sleep_ratio + 0.5 * power_saving  # [0, 1]
 
         # --- المكافأة الإجمالية الموزونة ---
+        # النطاق النظري: [-0.25, 0.9]
         reward = (
             0.5 * connectivity_reward +
             0.4 * energy_reward
         )
 
-        # --- عقوبة تناسبية لنفاد البطارية ---
+        # --- عقوبة مخففة لنفاد البطارية ---
         dead_nodes = np.sum(self.battery_levels <= 0)
         if dead_nodes > 0:
-            reward -= 5.0 * (dead_nodes / self.num_nodes)
+            reward -= 1.0 * (dead_nodes / self.num_nodes)
 
-        return reward
+        return float(reward)
     
     # ==========================================
     # 6. العرض المرئي (Rendering)
