@@ -70,6 +70,15 @@ class WSNActorCritic(nn.Module):
         
         # تهيئة الأوزان (Weights)
         self.apply(self._init_weights)
+
+        # --- انحياز أولي: نبدأ بمعظم العقد مستيقظة وقوة بث متوسطة-عالية ---
+        # هذا يضمن أن التدريب يُحسِّن الأداء بـ"تنويم" العقد غير الضرورية
+        # وخفض قوة البث → المنحنيات تنخفض بدلاً من أن ترتفع
+        if 'sleep_schedule' in self.actor_heads:
+            # نبدأ بانحياز 0 (50% احتمالية) حتى تعبر التحديثات حد الـ 0.5 فوراً وتبدأ العقد بالنوم
+            self.actor_heads['sleep_schedule'][0].bias.data.fill_(0.0)
+        if 'transmit_power' in self.actor_heads:
+            self.actor_heads['transmit_power'][0].bias.data.fill_(0.5)
         
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):

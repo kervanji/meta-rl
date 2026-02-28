@@ -176,22 +176,30 @@ class WSNAbstractEnv(gym.Env):
             isolation_penalty = 0.5 * (isolated_awake / max(num_awake, 1))
             connectivity_reward = connectivity_ratio - isolation_penalty  # [-0.5, 1]
 
-        # --- مكافأة الطاقة ---
-        sleep_ratio = np.mean(sleep_schedule)          # نسبة العقد النائمة [0, 1]
-        power_saving = 1.0 - np.mean(transmit_power)   # توفير قوة البث [0, 1]
-        energy_reward = 0.5 * sleep_ratio + 0.5 * power_saving  # [0, 1]
+        # --- نسبة الاستيقاظ والنوم ---
+        TARGET_SLEEP = 0.40  # هدف: 40% من العقد تنام
+        awake_ratio = num_awake / self.num_nodes
+        sleep_saving = 1.0 - awake_ratio  # [0, 1) — أعلى = أكثر عقداً نائمة
+        # مكافأة النوم ترتفع خطيّاً حتى الهدف (تدرج قوي) ثم تثبت (لا فائدة من النوم الزائد)
+        capped_sleep = min(sleep_saving, TARGET_SLEEP)
+        sleep_reward = capped_sleep / TARGET_SLEEP  # معيَّر إلى [0, 1]
 
-        # --- المكافأة الإجمالية الموزونة ---
-        # النطاق النظري: [-0.25, 0.9]
-        reward = (
-            0.5 * connectivity_reward +
-            0.4 * energy_reward
-        )
+        # --- اتصال العقد المستيقظة فقط [0, 1] ---
+        # (العقد النائمة لا تُشارك في التوجيه فلا تُحسب)
+        if num_awake > 0:
+            awake_connectivity = connected_awake / num_awake
+        else:
+            return -0.5  # عقوبة قصوى إذا نامت كل الشبكة
 
-        # --- عقوبة مخففة لنفاد البطارية ---
+        # --- المكافأة: النوم يُوفِّر الطاقة، الاتصال يُقلِّل التأخير ---
+        # 70% وزن لتوفير الطاقة عبر تنويم العقد غير الضرورية
+        # 30% وزن لاتصال العقد المستيقظة (يمنع تنويم عقد الهيكل العظمي)
+        reward = 0.80 * sleep_reward + 0.20 * awake_connectivity
+
+        # --- عقوبة نفاد البطارية ---
         dead_nodes = np.sum(self.battery_levels <= 0)
         if dead_nodes > 0:
-            reward -= 1.0 * (dead_nodes / self.num_nodes)
+            reward -= 0.3 * (dead_nodes / self.num_nodes)
 
         return float(reward)
     

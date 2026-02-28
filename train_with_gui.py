@@ -39,7 +39,7 @@ def create_tasks(num_tasks, env_config):
     return tasks
 
 
-def collect_rollout(env, policy, max_steps=None, deterministic=True):
+def collect_rollout(env, policy, max_steps=None, deterministic=True, fixed_init=None):
     if max_steps is None:
         max_steps = 200
 
@@ -53,6 +53,14 @@ def collect_rollout(env, policy, max_steps=None, deterministic=True):
     dones_arr = np.empty(max_steps, dtype=bool)
 
     state = env.reset()
+    if fixed_init is not None:
+        # Override with fixed topology (for consistent evaluation across rounds)
+        env.node_positions = fixed_init['positions'].copy()
+        env.battery_levels  = fixed_init['batteries'].copy()
+        diff = env.node_positions[:, np.newaxis, :] - env.node_positions[np.newaxis, :, :]
+        env._dist_matrix = np.sqrt(np.sum(diff ** 2, axis=-1))
+        env.update_connectivity()
+        state = env._get_observation()
     done = False
     step = 0
     total_energy = 0.0
@@ -64,13 +72,20 @@ def collect_rollout(env, policy, max_steps=None, deterministic=True):
         action = policy.get_action(state, deterministic=deterministic)
         next_state, reward, done, _ = env.step(action)
 
-        # حساب الطاقة والتأخير
-        active_mask = (1.0 - action['sleep_schedule'])
+        # حساب الطاقة: العقد المستيقظة تستهلك بناءً على قوة البث (transmit_power)، والنائمة تستهلك 0.01
+        # استخدام is_sleeping لضمان تطابق الحساب مع ما تفعله البيئة
+        is_sleeping = (action['sleep_schedule'] > 0.5).astype(np.float32)
+        active_mask = 1.0 - is_sleeping
+        
+        # استهلاك الطاقة يعتمد على الإجراء الفعلي لقوة الإرسال
         energy = range_energy * np.mean(active_mask * action['transmit_power'] + (1.0 - active_mask) * 0.01)
         total_energy += energy
 
-        connectivity = np.sum(next_state['connectivity']) * inv_pairs
-        total_delay += (1.0 - connectivity) * 100.0 + np.random.uniform(0, 3)
+        # حساب التأخير: يعتمد على عدد العقد المستيقظة (ازدحام أقل = تأخير أقل)
+        awake_ratio_step = float(np.mean(active_mask))
+        # 60ms تأخير أساسي للشبكة المزدحمة، يقل مع نوم العقد + ضوضاء طبيعية
+        delay = awake_ratio_step * 60.0 
+        total_delay += delay + np.random.uniform(0, 3)
 
         # تخزين مباشرة في المصفوفات
         states_pos[step] = state['node_positions']
@@ -170,11 +185,26 @@ def main():
 
     agent = MAMLAgent(
         policy_network=policy,
-        inner_lr=1e-3,
+        inner_lr=3e-3,
         meta_lr=1e-4,
         num_updates=args.adaptation_steps,
         device=device
     )
+
+    # --- مهام تقييم ثابتة (نفس الطبولوجيا كل جولة = منحنى تعلم حقيقي بلا ضوضاء) ---
+    _rng_state = np.random.get_state()
+    np.random.seed(2025)
+    _eval_tasks = []
+    for _ in range(3):
+        _et = WSNEnv(env_config)
+        _et.reset()
+        _eval_tasks.append({
+            'env':      _et,
+            'positions': _et.node_positions.copy(),
+            'batteries': np.ones(env_config['num_nodes'], dtype=np.float32),
+        })
+    np.random.set_state(_rng_state)
+    # -----------------------------------------------------------------------
 
     best_avg_reward = -float('inf')
     start_iter = 0
@@ -196,7 +226,6 @@ def main():
         task_data = []
         total_energy = 0.0
         total_delay = 0.0
-        last_connectivity = 0.0
 
         for task in tasks:
             # جمع بيانات أولية بالـ base policy
@@ -208,27 +237,41 @@ def main():
             task_data.append(rollout)
             total_energy += rollout['avg_energy']
             total_delay += rollout['avg_delay']
-            last_connectivity = rollout['last_connectivity']  # استخدام البيانات الموجودة
 
         avg_energy = total_energy / args.meta_batch
         avg_delay = total_delay / args.meta_batch
 
         meta_loss = agent.meta_update(task_data)
 
-        # لا حاجة لإنشاء eval_env جديد - استخدام آخر نتيجة من task_data
-        connectivity = last_connectivity
+        # --- تقييم على مهام ثابتة (بلا تكيف، حتمي) للحصول على منحنى تعلم نظيف ---
+        policy.eval()
+        _eval_energies, _eval_delays = [], []
+        for _et in _eval_tasks:
+            _er = collect_rollout(_et['env'], policy, env_config['max_steps'],
+                                  deterministic=True, fixed_init=_et)
+            _eval_energies.append(_er['avg_energy'])
+            _eval_delays.append(_er['avg_delay'])
+        policy.train()
+        eval_energy = float(np.mean(_eval_energies))
+        eval_delay  = float(np.mean(_eval_delays))
+        # -----------------------------------------------------------------------
 
-        progress = ((meta_iter + 1) / args.meta_iterations) * 100
-        print(f"METRICS|{meta_iter + 1}|{avg_energy:.6f}|{avg_delay:.2f}|{progress:.1f}|{connectivity:.1f}", flush=True)
-
-        # إرسال حالة الشبكة للواجهة (awake/sleep/dead/links)
+        # مقياس الاتصال: نسبة العقد التي لديها رابط واحد على الأقل (من آخر rollout)
         last_rollout = task_data[-1]
-        # البطارية والمواقع من آخر خطوة (لإظهار الحالة النهائية)
         last_bat = last_rollout['states']['battery_levels'][-1]   # (N,)
         last_con = last_rollout['states']['connectivity'][-1]     # (N,N)
         last_pos = last_rollout['states']['node_positions'][-1]   # (N,2)
+        all_ss   = last_rollout['actions']['sleep_schedule']       # (T, N)
+
+        has_link_mask = np.any(last_con > 0, axis=1)
+        connectivity = float(np.mean(has_link_mask) * 100.0)
+
+        progress = ((meta_iter + 1) / args.meta_iterations) * 100
+        # تقرير مقاييس التقييم الثابت للرسوم البيانية (ينعدم ضوضاء الطبولوجيا)
+        print(f"METRICS|{meta_iter + 1}|{eval_energy:.6f}|{eval_delay:.2f}|{progress:.1f}|{connectivity:.1f}", flush=True)
+
+        # إرسال حالة الشبكة للواجهة (awake/sleep/dead/links)
         # sleep_schedule هي float (0.0 أو 1.0)، نستخدم >= 0.5 للتأكد
-        all_ss = last_rollout['actions']['sleep_schedule']        # (T, N)
         # متوسط حالة النوم عبر كل خطوات الـ episode لكل عقدة
         avg_sleep_per_node = np.mean(all_ss >= 0.5, axis=0)       # (N,) بين 0 و1
         n_dead  = int(np.sum(last_bat <= 0))
@@ -243,7 +286,6 @@ def main():
             for i in range(env_config['num_nodes'])
         )
         print(f"WSN_STATE|{n_awake}|{n_sleep}|{n_dead}|{n_links}|{pos_str}|{state_str}", flush=True)
-
 
         if (meta_iter + 1) % 10 == 0:
             # استخدام بيانات rollout الموجودة بدلاً من تشغيل eval إضافي

@@ -583,13 +583,38 @@ class TrainingGUI:
                                      color=COLORS['accent_orange'])
         self.card_delay.grid(row=0, column=2, sticky='ew', padx=8)
         
-        self.card_connectivity = MetricCard(cards_frame, "Connectivity", "0.0%",
+        self.card_connectivity = MetricCard(cards_frame, "Node Connectivity", "0.0%",
                                             color=COLORS['text_primary'])
         self.card_connectivity.grid(row=0, column=3, sticky='ew', padx=(8, 0))
-        
+
+        # Training progress bar
+        progress_frame = tk.Frame(cards_frame, bg=COLORS['bg_dark'])
+        progress_frame.grid(row=1, column=0, columnspan=4, sticky='ew', pady=(10, 0))
+
+        tk.Label(progress_frame, text="Training Progress",
+                 font=('Segoe UI', 9),
+                 fg=COLORS['text_secondary'],
+                 bg=COLORS['bg_dark']).pack(side='left', padx=(2, 10))
+
+        self.progress_var = tk.DoubleVar(value=0.0)
+        self.progress_bar = ttk.Progressbar(
+            progress_frame,
+            variable=self.progress_var,
+            maximum=100.0,
+            mode='determinate'
+        )
+        self.progress_bar.pack(side='left', fill='x', expand=True)
+
+        self.progress_label = tk.Label(progress_frame, text="0.0%",
+                                       font=('Segoe UI', 9, 'bold'),
+                                       fg=COLORS['accent_cyan'],
+                                       bg=COLORS['bg_dark'],
+                                       width=7)
+        self.progress_label.pack(side='left', padx=(8, 2))
+
         # Energy reduction insight card
         insight_frame = tk.Frame(cards_frame, bg=COLORS['bg_card'])
-        insight_frame.grid(row=1, column=0, columnspan=4, sticky='ew', pady=(12, 0))
+        insight_frame.grid(row=2, column=0, columnspan=4, sticky='ew', pady=(10, 0))
         insight_frame.columnconfigure(0, weight=1)
         
         title = tk.Label(insight_frame, text="Energy Reduction vs Delay",
@@ -674,7 +699,7 @@ class TrainingGUI:
         self.ax_energy.grid(True, linestyle='--', alpha=0.3, color=COLORS['border'])
         for spine in self.ax_energy.spines.values():
             spine.set_color(COLORS['border'])
-        self.line_energy, = self.ax_energy.plot([], [], color=COLORS['accent_cyan'], 
+        self.line_energy, = self.ax_energy.plot([], [], color=COLORS['accent_cyan'],
                                                  linewidth=2)
         
         self.ax_delay = self.fig.add_subplot(122)
@@ -687,8 +712,8 @@ class TrainingGUI:
         self.ax_delay.grid(True, linestyle='--', alpha=0.3, color=COLORS['border'])
         for spine in self.ax_delay.spines.values():
             spine.set_color(COLORS['border'])
-        self.line_delay, = self.ax_delay.plot([], [], color=COLORS['accent_orange'], 
-                                               linewidth=1)
+        self.line_delay, = self.ax_delay.plot([], [], color=COLORS['accent_orange'],
+                                               linewidth=2)
         
         self.fig.tight_layout(pad=1.5)
         
@@ -753,17 +778,15 @@ class TrainingGUI:
         self.rounds.append(display_round)
         self.energy_data.append(energy)
         self.delay_data.append(delay)
-        
-        # Update Energy Chart
+
         self.line_energy.set_data(self.rounds, self.energy_data)
         self.ax_energy.relim()
         self.ax_energy.autoscale_view()
-        
-        # Update Delay Chart
+
         self.line_delay.set_data(self.rounds, self.delay_data)
         self.ax_delay.relim()
         self.ax_delay.autoscale_view()
-        
+
         self.canvas.draw()
         
     def update_wsn_topology(self, n_awake, n_sleep, n_dead, n_links, positions, states):
@@ -877,6 +900,12 @@ class TrainingGUI:
 
         # Reset metric cards
         self.update_metric_cards(0.0, 0.0, 0.0, 0.0)
+
+        # Reset progress bar
+        if hasattr(self, 'progress_var'):
+            self.progress_var.set(0.0)
+        if hasattr(self, 'progress_label'):
+            self.progress_label.config(text="0.0%")
     
     def update_metric_cards(self, reward=None, energy=None, delay=None, connectivity=None):
         if reward is not None:
@@ -1061,10 +1090,13 @@ class TrainingGUI:
                         delay = float(parts[3])
                         progress = float(parts[4])
                         connectivity = float(parts[5]) if len(parts) > 5 else 0
-                        
+
                         self.update_charts(round_num, energy, delay)
-                        self.update_metric_cards(energy=energy, delay=delay, 
+                        self.update_metric_cards(energy=energy, delay=delay,
                                                 connectivity=connectivity)
+                        # Update progress bar
+                        self.progress_var.set(progress)
+                        self.progress_label.config(text=f"{progress:.1f}%")
                 elif line.startswith("WSN_STATE|"):
                     # WSN_STATE|n_awake|n_sleep|n_dead|n_links|pos_str|state_str
                     parts = line.strip().split("|")

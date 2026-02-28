@@ -49,6 +49,45 @@ class MAMLAgent:
         
         # دالة الخسارة
         self.loss_fn = nn.MSELoss()
+
+    @staticmethod
+    def _compute_returns(rewards_np: np.ndarray, gamma: float = 0.99) -> np.ndarray:
+        """حساب العوائد المخصومة G_t = r_t + γ·r_{t+1} + γ²·r_{t+2} + …"""
+        T = len(rewards_np)
+        returns = np.zeros(T, dtype=np.float32)
+        G = 0.0
+        for t in reversed(range(T)):
+            G = float(rewards_np[t]) + gamma * G
+            returns[t] = G
+        return returns
+
+    def _reward_weighted_loss(
+        self,
+        preds: Dict[str, torch.Tensor],
+        actions: Dict[str, torch.Tensor],
+        rewards_np: np.ndarray,
+        gamma: float = 0.99,
+    ) -> torch.Tensor:
+        """
+        Advantage-Weighted Regression (AWR) مع عوائد مخصومة:
+        استخدام G_t بدلاً من r_t يمنح الخطوات الأولى إشارةً أقوى
+        لأنها تعكس جودة الإجراء على المدى البعيد وليس الفوري فقط.
+        """
+        returns_np = self._compute_returns(rewards_np, gamma)
+        returns_t = torch.from_numpy(returns_np).to(self.device)
+        std = returns_t.std()
+        adv = (returns_t - returns_t.mean()) / (std + 1e-8)
+        # أوزان موجبة ومركزها 1 — high-return steps get w > 1
+        weights = torch.clamp(adv + 1.0, min=0.1).detach()
+        weights = weights / weights.mean()
+
+        loss = None
+        for name in actions.keys():
+            # خسارة MSE لكل خطوة زمنية → شكل (T,)
+            per_step = (preds[name] - actions[name]).pow(2).mean(dim=-1)
+            w_loss = (per_step * weights).mean()
+            loss = w_loss if loss is None else loss + w_loss
+        return loss if loss is not None else torch.zeros(1, device=self.device)
         
     def adapt(self, task_data: Dict[str, object], num_steps: int = None) -> nn.Module:
         """
@@ -75,16 +114,16 @@ class MAMLAgent:
         states = {k: torch.from_numpy(v).float().to(self.device) for k, v in states_np.items()}
         actions = {k: torch.from_numpy(v).float().to(self.device) for k, v in actions_np.items()}
         
-        # التكيف في الحلقة الداخلية (Inner loop)
+        rewards_np: np.ndarray = task_data['rewards']
+
+        # التكيف في الحلقة الداخلية (Inner loop) — AWR-weighted loss
         for _ in range(num_steps):
             # Forward pass
             action_preds, _ = adapted_policy(states)
-            
-            # حساب الخسارة لجميع مكونات الإجراء
-            loss = 0.0
-            for name in actions.keys():
-                loss = loss + self.loss_fn(action_preds[name], actions[name])
-            
+
+            # خسارة موزونة بالمكافأة بدلاً من MSE بسيط
+            loss = self._reward_weighted_loss(action_preds, actions, rewards_np)
+
             # تحديث السياسة المتكيفة
             adapted_optimizer.zero_grad()
             loss.backward()
@@ -119,6 +158,7 @@ class MAMLAgent:
         for task_data in meta_batch:
             states_np: Dict[str, np.ndarray] = task_data['states']
             actions_np: Dict[str, np.ndarray] = task_data['actions']
+            rewards_np: np.ndarray = task_data['rewards']
 
             states = {k: torch.from_numpy(v).float().to(self.device) for k, v in states_np.items()}
             actions = {k: torch.from_numpy(v).float().to(self.device) for k, v in actions_np.items()}
@@ -126,10 +166,8 @@ class MAMLAgent:
             # التمرير الأمامي عبر السياسة الأساسية
             preds, _ = self.policy(states)
 
-            # حساب الخسارة لجميع مكونات الإجراء
-            loss = 0.0
-            for name in actions.keys():
-                loss = loss + self.loss_fn(preds[name], actions[name])
+            # خسارة AWR موزونة بالمكافأة — يتعلم العميل تكرار الأفعال ذات المكافأة العالية
+            loss = self._reward_weighted_loss(preds, actions, rewards_np)
 
             total_meta_loss += loss.item()
 
@@ -138,6 +176,9 @@ class MAMLAgent:
 
         # حساب متوسط الخسارة الشاملة
         avg_meta_loss = total_meta_loss / len(meta_batch)
+
+        # قص التدرجات لمنع الانفجار (Gradient clipping)
+        torch.nn.utils.clip_grad_norm_(self.policy.parameters(), max_norm=1.0)
 
         # تنفيذ خطوة المحسن (Optimizer step)
         self.meta_optimizer.step()
