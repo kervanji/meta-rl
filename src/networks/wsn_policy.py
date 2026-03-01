@@ -23,7 +23,7 @@ class WSNActorCritic(nn.Module):
         self,
         state_dim: int,
         action_dims: Dict[str, int],
-        hidden_dims: List[int] = [128, 64],
+        hidden_dims: List[int] = [256, 128, 64],
         device: str = 'cuda' if torch.cuda.is_available() else 'cpu'
     ):
         """
@@ -71,14 +71,14 @@ class WSNActorCritic(nn.Module):
         # تهيئة الأوزان (Weights)
         self.apply(self._init_weights)
 
-        # --- انحياز أولي: نبدأ بمعظم العقد مستيقظة وقوة بث متوسطة-عالية ---
-        # هذا يضمن أن التدريب يُحسِّن الأداء بـ"تنويم" العقد غير الضرورية
-        # وخفض قوة البث → المنحنيات تنخفض بدلاً من أن ترتفع
+        # --- انحياز أولي: نبدأ بمزيج مستيقظة/نائمة وقوة بث عالية ---
+        # sigmoid(-0.5) ≈ 0.38 → حوالي 38% تنام منذ البداية
+        # هذا يعطي الذكاء الاصطناعي نقطة بداية جيدة لتعلم أي العقد تنام وأيها تبقى
         if 'sleep_schedule' in self.actor_heads:
-            # نبدأ بانحياز 0 (50% احتمالية) حتى تعبر التحديثات حد الـ 0.5 فوراً وتبدأ العقد بالنوم
-            self.actor_heads['sleep_schedule'][0].bias.data.fill_(0.0)
+            self.actor_heads['sleep_schedule'][0].bias.data.fill_(-0.5)
         if 'transmit_power' in self.actor_heads:
-            self.actor_heads['transmit_power'][0].bias.data.fill_(0.5)
+            # sigmoid(2.0) ≈ 0.88 → بث قوي من البداية لضمان التغطية
+            self.actor_heads['transmit_power'][0].bias.data.fill_(2.0)
         
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):

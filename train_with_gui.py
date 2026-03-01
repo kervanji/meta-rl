@@ -39,6 +39,18 @@ def create_tasks(num_tasks, env_config):
     return tasks
 
 
+def read_force_death_pct():
+    """قراءة نسبة الموت الإجباري من الملف المشترك مع الواجهة."""
+    try:
+        fpath = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.force_death_pct')
+        if os.path.exists(fpath):
+            with open(fpath, 'r') as f:
+                return int(f.read().strip())
+    except Exception:
+        pass
+    return 0
+
+
 def collect_rollout(env, policy, max_steps=None, deterministic=True, fixed_init=None):
     if max_steps is None:
         max_steps = 200
@@ -81,11 +93,16 @@ def collect_rollout(env, policy, max_steps=None, deterministic=True, fixed_init=
         energy = range_energy * np.mean(active_mask * action['transmit_power'] + (1.0 - active_mask) * 0.01)
         total_energy += energy
 
-        # حساب التأخير: يعتمد على عدد العقد المستيقظة (ازدحام أقل = تأخير أقل)
-        awake_ratio_step = float(np.mean(active_mask))
-        # 60ms تأخير أساسي للشبكة المزدحمة، يقل مع نوم العقد + ضوضاء طبيعية
-        delay = awake_ratio_step * 60.0 
-        total_delay += delay + np.random.uniform(0, 3)
+        # حساب التأخير (Delay): 
+        # base_latency = 5ms (تأخير الشبكة الأساسي)
+        # routing_penalty = نسبة العقد المعزولة × 100ms (مسارات طويلة وإعادة إرسال)
+        has_link = np.any(next_state['connectivity'] > 0, axis=1)
+        num_active = max(float(np.sum(active_mask)), 1.0)
+        connected_active = float(np.sum(has_link & (active_mask > 0.5)))
+        disconnection_ratio = 1.0 - (connected_active / num_active)
+        
+        delay = 5.0 + disconnection_ratio * 100.0 + np.random.uniform(0, 2)
+        total_delay += delay
 
         # تخزين مباشرة في المصفوفات
         states_pos[step] = state['node_positions']
@@ -221,7 +238,19 @@ def main():
     policy.train()
 
     for meta_iter in range(start_iter, args.meta_iterations):
+        # قراءة نسبة الموت الإجباري من الواجهة (قابلة للتغيير أثناء التدريب)
+        force_death_pct = read_force_death_pct()
+
         tasks = create_tasks(args.meta_batch, env_config)
+
+        # تطبيق الموت الإجباري على كل مهمة
+        if force_death_pct > 0:
+            for task in tasks:
+                n_kill = int(task.num_nodes * force_death_pct / 100)
+                if n_kill > 0:
+                    kill_indices = np.random.choice(task.num_nodes, size=n_kill, replace=False)
+                    task.battery_levels[kill_indices] = 0.0
+                    task.update_connectivity()
 
         task_data = []
         total_energy = 0.0
@@ -246,25 +275,46 @@ def main():
         # --- تقييم على مهام ثابتة (بلا تكيف، حتمي) للحصول على منحنى تعلم نظيف ---
         policy.eval()
         _eval_energies, _eval_delays = [], []
-        for _et in _eval_tasks:
+        _eval_rollouts = []
+        for _idx, _et in enumerate(_eval_tasks):
+            # تطبيق الموت الإجباري على مهام التقييم أيضاً
+            eval_init = dict(_et)  # نسخة سطحية
+            if force_death_pct > 0:
+                batteries = _et['batteries'].copy()
+                n_kill = int(len(batteries) * force_death_pct / 100)
+                if n_kill > 0:
+                    # seed ثابت لكل مهمة تقييم حتى يكون الموت متسقاً خلال نفس الجولة
+                    _rng = np.random.RandomState(42 + _idx)
+                    kill_idx = _rng.choice(len(batteries), size=n_kill, replace=False)
+                    batteries[kill_idx] = 0.0
+                eval_init['batteries'] = batteries
             _er = collect_rollout(_et['env'], policy, env_config['max_steps'],
-                                  deterministic=True, fixed_init=_et)
+                                  deterministic=True, fixed_init=eval_init)
             _eval_energies.append(_er['avg_energy'])
             _eval_delays.append(_er['avg_delay'])
+            _eval_rollouts.append(_er)
         policy.train()
         eval_energy = float(np.mean(_eval_energies))
         eval_delay  = float(np.mean(_eval_delays))
         # -----------------------------------------------------------------------
 
-        # مقياس الاتصال: نسبة العقد التي لديها رابط واحد على الأقل (من آخر rollout)
-        last_rollout = task_data[-1]
+        # مقياس الاتصال: نسبة العقد المستيقظة التي لديها رابط واحد على الأقل (من مهمة التقييم الثابتة)
+        last_rollout = _eval_rollouts[0]
         last_bat = last_rollout['states']['battery_levels'][-1]   # (N,)
         last_con = last_rollout['states']['connectivity'][-1]     # (N,N)
         last_pos = last_rollout['states']['node_positions'][-1]   # (N,2)
         all_ss   = last_rollout['actions']['sleep_schedule']       # (T, N)
 
+        last_ss_final = all_ss[-1]
+        awake_mask = (last_ss_final < 0.5)
+        num_awake_eval = np.sum(awake_mask)
+        
         has_link_mask = np.any(last_con > 0, axis=1)
-        connectivity = float(np.mean(has_link_mask) * 100.0)
+        if num_awake_eval > 0:
+            connected_awake = np.sum(has_link_mask & awake_mask)
+            connectivity = float((connected_awake / num_awake_eval) * 100.0)
+        else:
+            connectivity = 0.0
 
         progress = ((meta_iter + 1) / args.meta_iterations) * 100
         # تقرير مقاييس التقييم الثابت للرسوم البيانية (ينعدم ضوضاء الطبولوجيا)

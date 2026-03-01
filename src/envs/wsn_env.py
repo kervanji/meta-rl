@@ -77,7 +77,9 @@ class WSNAbstractEnv(gym.Env):
         # استخدام مصفوفة المسافات المخزنة (لا حاجة لإعادة الحساب)
         dist = self._dist_matrix
 
-        effective_range = self.comm_range * transmit_power
+        # المدى الفعال: حد أدنى 50% من comm_range حتى عند أقل طاقة
+        # هذا يمنع الانقطاع الكامل عند خفض قوة البث
+        effective_range = self.comm_range * (0.5 + 0.5 * transmit_power)
         min_range = np.minimum(effective_range[:, np.newaxis], effective_range[np.newaxis, :])
 
         awake = (sleep_schedule == 0).astype(np.float32)
@@ -129,6 +131,8 @@ class WSNAbstractEnv(gym.Env):
         self.battery_levels -= self.energy_consumption * range_factor * (
             awake_mask * transmit_power + sleep_mask * idle_power
         )
+        # منع البطاريات من الانخفاض تحت الصفر
+        self.battery_levels = np.maximum(self.battery_levels, 0.0)
         
         # حساب المكافأة
         reward = self._calculate_reward(transmit_power, sleep_schedule)
@@ -138,7 +142,9 @@ class WSNAbstractEnv(gym.Env):
         self.current_step += 1
         
         # التحقق مما إذا كانت الحلقة قد انتهت
-        done = self.current_step >= self.max_steps or np.any(self.battery_levels <= 0)
+        # تنتهي فقط عندما يموت أكثر من 50% من العقد (يسمح بالتأقلم مع حالات الموت)
+        dead_ratio = np.sum(self.battery_levels <= 0) / self.num_nodes
+        done = self.current_step >= self.max_steps or dead_ratio > 0.5
         
         return self._get_observation(), reward, done, {}
     
@@ -151,55 +157,39 @@ class WSNAbstractEnv(gym.Env):
     # - لزيادة الاهتمام بالاتصال: اجعل وزن connectivity_score = 0.8
     # ==========================================
     def _calculate_reward(self, transmit_power: np.ndarray, sleep_schedule: np.ndarray) -> float:
-        """حساب المكافأة بناءً على الحالة الحالية والإجراءات المتخذة."""
-        # ---------------------------------------------------------
-        # مكونات المكافأة:
-        # 1. مكافأة الاتصال (وزن 0.5): نسبة العقد المستيقظة المتصلة
-        #    مع عقوبة طفيفة على العزل.
-        # 2. مكافأة الطاقة (وزن 0.4): مكافأة النوم وتخفيض قوة البث.
-        # 3. عقوبة تناسبية لعقد ميتة (مخففة).
-        # ---------------------------------------------------------
-
-        awake_mask = (sleep_schedule == 0)  # True للعقد المستيقظة
+        """
+        مكافأة بسيطة وقوية:
+        - الأولوية القصوى: اتصال العقد المستيقظة (85%)
+        - مكافأة ثانوية: تنويم العقد الزائدة فقط بعد تحقيق اتصال 80%+ (15%)
+        """
+        awake_mask = (sleep_schedule == 0)
         num_awake = int(np.sum(awake_mask))
 
-        # --- مكافأة الاتصال ---
         if num_awake == 0:
-            connectivity_reward = -1.0  # عقوبة قصوى إذا كانت كل الشبكة نائمة
-        else:
-            has_link = np.any(self.connectivity > 0, axis=1)  # (N,) bool
-            connected_awake = int(np.sum(has_link & awake_mask))
-            isolated_awake = num_awake - connected_awake
+            return -1.0
 
-            connectivity_ratio = connected_awake / num_awake  # [0, 1]
-            # عقوبة معتدلة على العزل (0.5 بدلاً من 2.0)
-            isolation_penalty = 0.5 * (isolated_awake / max(num_awake, 1))
-            connectivity_reward = connectivity_ratio - isolation_penalty  # [-0.5, 1]
+        # --- نسبة الاتصال للعقد المستيقظة ---
+        has_link = np.any(self.connectivity > 0, axis=1)
+        connected_awake = int(np.sum(has_link & awake_mask))
+        conn_ratio = connected_awake / num_awake  # [0, 1]
 
-        # --- نسبة الاستيقاظ والنوم ---
-        TARGET_SLEEP = 0.40  # هدف: 40% من العقد تنام
+        # --- مكافأة توفير الطاقة (مشروطة باتصال جيد أولاً) ---
         awake_ratio = num_awake / self.num_nodes
-        sleep_saving = 1.0 - awake_ratio  # [0, 1) — أعلى = أكثر عقداً نائمة
-        # مكافأة النوم ترتفع خطيّاً حتى الهدف (تدرج قوي) ثم تثبت (لا فائدة من النوم الزائد)
+        sleep_saving = 1.0 - awake_ratio
+        TARGET_SLEEP = 0.40
         capped_sleep = min(sleep_saving, TARGET_SLEEP)
-        sleep_reward = capped_sleep / TARGET_SLEEP  # معيَّر إلى [0, 1]
+        sleep_score = capped_sleep / TARGET_SLEEP  # [0, 1]
 
-        # --- اتصال العقد المستيقظة فقط [0, 1] ---
-        # (العقد النائمة لا تُشارك في التوجيه فلا تُحسب)
-        if num_awake > 0:
-            awake_connectivity = connected_awake / num_awake
-        else:
-            return -0.5  # عقوبة قصوى إذا نامت كل الشبكة
+        # البوابة: لا مكافأة نوم إلا إذا كان الاتصال ≥ 70%
+        gated_sleep = sleep_score if conn_ratio >= 0.70 else 0.0
 
-        # --- المكافأة: النوم يُوفِّر الطاقة، الاتصال يُقلِّل التأخير ---
-        # 70% وزن لتوفير الطاقة عبر تنويم العقد غير الضرورية
-        # 30% وزن لاتصال العقد المستيقظة (يمنع تنويم عقد الهيكل العظمي)
-        reward = 0.80 * sleep_reward + 0.20 * awake_connectivity
+        # --- المكافأة النهائية ---
+        reward = 0.65 * conn_ratio + 0.35 * gated_sleep
 
-        # --- عقوبة نفاد البطارية ---
+        # عقوبة نفاد البطارية
         dead_nodes = np.sum(self.battery_levels <= 0)
         if dead_nodes > 0:
-            reward -= 0.3 * (dead_nodes / self.num_nodes)
+            reward -= 0.5 * (dead_nodes / self.num_nodes)
 
         return float(reward)
     
