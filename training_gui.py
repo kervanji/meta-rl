@@ -525,27 +525,6 @@ class TrainingGUI:
                               wraplength=220, justify='left')
         device_desc.pack(anchor='w', pady=(5, 0))
 
-        # Simulation Controls Section (Live adjustable during training)
-        sim_section = CollapsibleSection(sidebar, "Simulation Controls", icon='#')
-        sim_section.pack(fill='x', pady=(0, 20))
-
-        self.setting_force_death = SettingRow(sim_section.content, "Force Node Death %",
-                                              0, 0, 50, is_float=False,
-                                              description="Force random nodes to die.\nUse this during training to test\nhow the agent adapts to failures.\n0% = no forced deaths.")
-        self.setting_force_death.pack(fill='x', pady=5)
-
-        # عند تغيير السلايدر، نكتب القيمة لملف مؤقت يقرأه سكريبت التدريب
-        self._force_death_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.force_death_pct')
-        self.setting_force_death.slider.config(command=self._on_force_death_change)
-        # تهيئة الملف بقيمة 0
-        self._write_force_death(0)
-
-        self._force_death_label = tk.Label(sim_section.content,
-                                           text="Forced Death: 0%",
-                                           font=('Segoe UI', 9, 'bold'),
-                                           fg=COLORS['text_secondary'],
-                                           bg=COLORS['bg_dark'])
-        self._force_death_label.pack(anchor='w', pady=(2, 0))
     
     def _show_ckpt_desc(self, event):
         if self._ckpt_popup:
@@ -574,28 +553,6 @@ class TrainingGUI:
         if self._ckpt_popup:
             self._ckpt_popup.destroy()
             self._ckpt_popup = None
-
-    def _write_force_death(self, pct):
-        """كتابة نسبة الموت الإجباري لملف مؤقت يقرأه سكريبت التدريب."""
-        try:
-            with open(self._force_death_file, 'w') as f:
-                f.write(str(int(pct)))
-        except Exception:
-            pass
-
-    def _on_force_death_change(self, value):
-        """عند تغيير سلايدر الموت الإجباري."""
-        pct = int(float(value))
-        self.setting_force_death.var.set(str(pct))
-        self._write_force_death(pct)
-        if pct > 0:
-            self._force_death_label.config(
-                text=f"Forced Death: {pct}%",
-                fg='#ef4444')
-        else:
-            self._force_death_label.config(
-                text="Forced Death: 0%",
-                fg=COLORS['text_secondary'])
 
     def _detect_device(self):
         try:
@@ -1047,6 +1004,14 @@ class TrainingGUI:
         config = self.validate_inputs()
         if config is None:
             return
+
+        # Ensure external script starts with forced-death disabled.
+        force_death_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.force_death_pct')
+        try:
+            with open(force_death_file, 'w') as f:
+                f.write('0')
+        except Exception:
+            pass
 
         # إذا لم يكن الاستئناف مفعّلاً، نمسح الـ checkpoint القديم حتى يبدأ التدريب من الصفر بالقيم الجديدة
         if not config.get('resume'):
