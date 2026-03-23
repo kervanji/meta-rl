@@ -102,11 +102,8 @@ def collect_rollout(env, policy, max_steps=None, deterministic=True, fixed_init=
         connected_active = float(np.sum(has_link & (active_mask > 0.5)))
         disconnection_ratio = 1.0 - (connected_active / num_active)
         
-        delay = 5.0 + disconnection_ratio * 100.0 + np.random.uniform(0, 2)
-        
-        # Add MAC collision penalty for uncoordinated Baseline transmissions
-        if getattr(policy, 'is_baseline', False):
-            delay += np.random.uniform(8.0, 12.0)
+        delay_noise = 0.0 if deterministic else np.random.uniform(0.0, 2.0)
+        delay = 5.0 + disconnection_ratio * 100.0 + delay_noise
             
         total_delay += delay
 
@@ -144,21 +141,138 @@ def collect_rollout(env, policy, max_steps=None, deterministic=True, fixed_init=
 
 
 class RuleBasedPolicy:
-    def __init__(self, transmit_power_val=1.0, sleep_prob=0.1):
-        self.transmit_power_val = transmit_power_val
-        self.sleep_prob = sleep_prob
-        self.is_baseline = True  # Flag to apply uncoordinated MAC collision penalty
+    """
+    Heuristic baseline that uses battery, local density, and node centrality.
+
+    It is deterministic during evaluation so the comparison against Meta-RL is
+    reproducible and not driven by baseline randomness.
+    """
+
+    def __init__(self, target_sleep_ratio=0.10, min_awake_ratio=0.70, exploration_noise=0.03, seed=42):
+        self.target_sleep_ratio = target_sleep_ratio
+        self.min_awake_ratio = min_awake_ratio
+        self.exploration_noise = exploration_noise
+        self.rng = np.random.RandomState(seed)
+
+    @staticmethod
+    def _normalize(values):
+        values = values.astype(np.float32, copy=False)
+        if values.size == 0:
+            return values
+        vmin = float(np.min(values))
+        vmax = float(np.max(values))
+        if vmax - vmin < 1e-8:
+            return np.zeros_like(values, dtype=np.float32)
+        return ((values - vmin) / (vmax - vmin)).astype(np.float32)
 
     def get_action(self, state, deterministic=True):
-        N = state['battery_levels'].shape[0]
-        tp = np.full(N, self.transmit_power_val, dtype=np.float32)
-        
-        # Standard Duty Cycling: Sleep a small percentage to save some energy
-        ss = (np.random.rand(N) < self.sleep_prob).astype(np.float32)
-        
-        # Dead nodes must sleep
-        ss[state['battery_levels'] <= 0] = 1.0
-        
+        positions = state['node_positions']
+        batteries = state['battery_levels'].astype(np.float32, copy=False)
+        connectivity = state['connectivity']
+        N = batteries.shape[0]
+
+        tp = np.zeros(N, dtype=np.float32)
+        ss = np.ones(N, dtype=np.float32)
+
+        alive_mask = batteries > 0
+        alive_indices = np.flatnonzero(alive_mask)
+        alive_count = int(alive_indices.size)
+
+        if alive_count == 0:
+            return {'transmit_power': tp, 'sleep_schedule': ss}
+
+        alive_positions = positions[alive_mask]
+        alive_batteries = batteries[alive_mask]
+
+        # تقدير كثافة الجوار هندسياً حتى لا يعتمد baseline على العشوائية.
+        if alive_count > 1:
+            diff = alive_positions[:, np.newaxis, :] - alive_positions[np.newaxis, :, :]
+            dist = np.sqrt(np.sum(diff ** 2, axis=-1))
+            np.fill_diagonal(dist, np.inf)
+
+            k = min(3, alive_count - 1)
+            nearest = np.partition(dist, kth=k - 1, axis=1)[:, :k]
+            mean_nearest = nearest.mean(axis=1)
+            density = 1.0 - self._normalize(mean_nearest)
+
+            centroid = np.mean(alive_positions, axis=0)
+            dist_to_centroid = np.sqrt(np.sum((alive_positions - centroid) ** 2, axis=1))
+            centrality = 1.0 - self._normalize(dist_to_centroid)
+
+            alive_connectivity = connectivity[np.ix_(alive_mask, alive_mask)]
+            degree = alive_connectivity.sum(axis=1).astype(np.float32)
+            degree_norm = degree / max(float(np.max(degree)), 1.0)
+        else:
+            density = np.ones(1, dtype=np.float32)
+            centrality = np.ones(1, dtype=np.float32)
+            degree_norm = np.ones(1, dtype=np.float32)
+
+        # عقد ذات بطارية جيدة وكثافة/مركزية أعلى تُفضَّل للبقاء مستيقظة كعقد relay.
+        relay_score = (
+            0.45 * alive_batteries +
+            0.20 * degree_norm +
+            0.20 * density +
+            0.15 * centrality
+        )
+        # العقد منخفضة البطارية وعالية التكرار المروري مرشحة للنوم.
+        sleep_score = (
+            0.55 * (1.0 - alive_batteries) +
+            0.30 * density +
+            0.15 * (1.0 - centrality)
+        )
+
+        min_awake = min(alive_count, max(3, int(np.ceil(self.min_awake_ratio * alive_count))))
+        target_sleep = min(
+            max(0, alive_count - min_awake),
+            int(np.floor(self.target_sleep_ratio * alive_count))
+        )
+
+        ss_alive = np.zeros(alive_count, dtype=np.float32)
+        if target_sleep > 0:
+            relay_cutoff = np.quantile(relay_score, 0.70) if alive_count > 1 else relay_score[0]
+            top_relay_cutoff = np.quantile(relay_score, 0.85) if alive_count > 1 else relay_score[0]
+            candidate_order = np.argsort(-sleep_score)
+            slept = 0
+
+            for idx in candidate_order:
+                if slept >= target_sleep:
+                    break
+                if relay_score[idx] >= relay_cutoff or degree_norm[idx] < 0.35:
+                    continue
+                ss_alive[idx] = 1.0
+                slept += 1
+
+            if slept < target_sleep:
+                for idx in candidate_order:
+                    if slept >= target_sleep:
+                        break
+                    if ss_alive[idx] > 0.5 or relay_score[idx] >= top_relay_cutoff:
+                        continue
+                    ss_alive[idx] = 1.0
+                    slept += 1
+
+        tp_alive = (
+            0.55 +
+            0.25 * (1.0 - density) +
+            0.15 * (1.0 - degree_norm) +
+            0.05 * centrality
+        )
+        tp_alive -= np.where(alive_batteries < 0.30, 0.10, 0.0).astype(np.float32)
+        tp_alive += np.where((degree_norm < 0.25) | (centrality < 0.35), 0.10, 0.0).astype(np.float32)
+        tp_alive = np.clip(tp_alive, 0.35, 1.0)
+
+        if not deterministic:
+            tp_alive = np.clip(
+                tp_alive + self.rng.uniform(-self.exploration_noise, self.exploration_noise, size=alive_count),
+                0.35,
+                1.0
+            )
+
+        tp_alive[ss_alive > 0.5] = 0.0
+
+        tp[alive_indices] = tp_alive.astype(np.float32, copy=False)
+        ss[alive_indices] = ss_alive
+
         return {
             'transmit_power': tp,
             'sleep_schedule': ss
@@ -252,8 +366,8 @@ def main():
     # -----------------------------------------------------------------------
 
     if args.baseline:
-        print("=== Running Rule-Based Baseline ===", flush=True)
-        baseline_policy = RuleBasedPolicy(transmit_power_val=1.0, sleep_prob=0.1)
+        print("=== Running Heuristic Baseline ===", flush=True)
+        baseline_policy = RuleBasedPolicy(target_sleep_ratio=0.10, min_awake_ratio=0.70, seed=42)
         for meta_iter in range(args.meta_iterations):
             force_death_pct = read_force_death_pct()
             
@@ -314,13 +428,13 @@ def main():
             
             if (meta_iter + 1) % 10 == 0:
                 avg_reward = float(np.mean(last_rollout['rewards']))
-                print(f"Round {meta_iter + 1} [Baseline]: Reward={avg_reward:.3f}, Energy={eval_energy:.6f}, Delay={eval_delay:.2f}ms", flush=True)
+                print(f"Round {meta_iter + 1} [Heuristic Baseline]: Reward={avg_reward:.3f}, Energy={eval_energy:.6f}, Delay={eval_delay:.2f}ms", flush=True)
                 print(f"REWARD|{avg_reward:.3f}", flush=True)
             
             time.sleep(0.05)
             
         print("=" * 60, flush=True)
-        print("=== Baseline finished ===", flush=True)
+        print("=== Heuristic baseline finished ===", flush=True)
         return
 
     best_avg_reward = -float('inf')

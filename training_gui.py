@@ -417,10 +417,10 @@ class TrainingGUI:
         self.btn_stop.pack(side='right', padx=5)
         self.btn_stop.set_enabled(False)
         
-        self.btn_baseline = ModernButton(right, "Run Baseline",
+        self.btn_baseline = ModernButton(right, "Run Heuristic Baseline",
                                       command=lambda: self.start_training(is_baseline=True),
                                       bg_color='#8b5cf6', # purple color for baseline
-                                      width=110, height=34)
+                                      width=170, height=34)
         self.btn_baseline.pack(side='right', padx=5)
         
         self.btn_start = ModernButton(right, "Start Training",
@@ -712,7 +712,7 @@ class TrainingGUI:
         self.line_energy, = self.ax_energy.plot([], [], color=COLORS['accent_cyan'],
                                                  linewidth=2, label='Meta-RL')
         self.line_energy_base, = self.ax_energy.plot([], [], color='#a855f7',
-                                                 linewidth=2, linestyle='--', label='Baseline')
+                                                 linewidth=2, linestyle='--', label='Heuristic Baseline')
         self.ax_energy.legend(loc='upper right', fontsize=8,
                             facecolor=COLORS['chart_bg'], edgecolor=COLORS['border'],
                             labelcolor=COLORS['text_primary'])
@@ -730,7 +730,7 @@ class TrainingGUI:
         self.line_delay, = self.ax_delay.plot([], [], color=COLORS['accent_orange'],
                                                linewidth=2, label='Meta-RL')
         self.line_delay_base, = self.ax_delay.plot([], [], color='#ec4899',
-                                               linewidth=2, linestyle='--', label='Baseline')
+                                               linewidth=2, linestyle='--', label='Heuristic Baseline')
         self.ax_delay.legend(loc='upper right', fontsize=8,
                             facecolor=COLORS['chart_bg'], edgecolor=COLORS['border'],
                             labelcolor=COLORS['text_primary'])
@@ -1066,7 +1066,7 @@ class TrainingGUI:
         self.btn_baseline.set_enabled(False)
         self.btn_stop.set_enabled(True)
         
-        self.status_label.config(text="Running Baseline..." if is_baseline else "Training...")
+        self.status_label.config(text="Running Heuristic Baseline..." if is_baseline else "Training...")
         self.status_dot.config(fg=COLORS['accent_cyan'] if is_baseline else COLORS['accent_orange'])
         self.clear_charts(is_baseline=is_baseline)
         
