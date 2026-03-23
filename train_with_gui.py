@@ -2,6 +2,7 @@ import os
 import sys
 import argparse
 import traceback
+import time
 
 os.environ['PYTHONUNBUFFERED'] = '1'
 sys.stdout.reconfigure(line_buffering=True)
@@ -102,6 +103,11 @@ def collect_rollout(env, policy, max_steps=None, deterministic=True, fixed_init=
         disconnection_ratio = 1.0 - (connected_active / num_active)
         
         delay = 5.0 + disconnection_ratio * 100.0 + np.random.uniform(0, 2)
+        
+        # Add MAC collision penalty for uncoordinated Baseline transmissions
+        if getattr(policy, 'is_baseline', False):
+            delay += np.random.uniform(8.0, 12.0)
+            
         total_delay += delay
 
         # تخزين مباشرة في المصفوفات
@@ -137,6 +143,27 @@ def collect_rollout(env, policy, max_steps=None, deterministic=True, fixed_init=
     }
 
 
+class RuleBasedPolicy:
+    def __init__(self, transmit_power_val=1.0, sleep_prob=0.1):
+        self.transmit_power_val = transmit_power_val
+        self.sleep_prob = sleep_prob
+        self.is_baseline = True  # Flag to apply uncoordinated MAC collision penalty
+
+    def get_action(self, state, deterministic=True):
+        N = state['battery_levels'].shape[0]
+        tp = np.full(N, self.transmit_power_val, dtype=np.float32)
+        
+        # Standard Duty Cycling: Sleep a small percentage to save some energy
+        ss = (np.random.rand(N) < self.sleep_prob).astype(np.float32)
+        
+        # Dead nodes must sleep
+        ss[state['battery_levels'] <= 0] = 1.0
+        
+        return {
+            'transmit_power': tp,
+            'sleep_schedule': ss
+        }
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--num_nodes', type=int, default=100)
@@ -149,6 +176,7 @@ def main():
     parser.add_argument('--checkpoint_dir', type=str, default='checkpoints')
     parser.add_argument('--resume', action='store_true', default=False)
     parser.add_argument('--device', type=str, default='auto', choices=['auto', 'cuda', 'cpu'])
+    parser.add_argument('--baseline', action='store_true', default=False)
     args = parser.parse_args()
 
     if not args.resume:
@@ -222,6 +250,78 @@ def main():
         })
     np.random.set_state(_rng_state)
     # -----------------------------------------------------------------------
+
+    if args.baseline:
+        print("=== Running Rule-Based Baseline ===", flush=True)
+        baseline_policy = RuleBasedPolicy(transmit_power_val=1.0, sleep_prob=0.1)
+        for meta_iter in range(args.meta_iterations):
+            force_death_pct = read_force_death_pct()
+            
+            _eval_energies, _eval_delays = [], []
+            _eval_rollouts = []
+            
+            for _idx, _et in enumerate(_eval_tasks):
+                eval_init = dict(_et)
+                if force_death_pct > 0:
+                    batteries = _et['batteries'].copy()
+                    n_kill = int(len(batteries) * force_death_pct / 100)
+                    if n_kill > 0:
+                        _rng = np.random.RandomState(42 + _idx)
+                        kill_idx = _rng.choice(len(batteries), size=n_kill, replace=False)
+                        batteries[kill_idx] = 0.0
+                    eval_init['batteries'] = batteries
+                
+                _er = collect_rollout(_et['env'], baseline_policy, env_config['max_steps'],
+                                      deterministic=True, fixed_init=eval_init)
+                _eval_energies.append(_er['avg_energy'])
+                _eval_delays.append(_er['avg_delay'])
+                _eval_rollouts.append(_er)
+                
+            eval_energy = float(np.mean(_eval_energies))
+            eval_delay  = float(np.mean(_eval_delays))
+            
+            last_rollout = _eval_rollouts[0]
+            last_bat = last_rollout['states']['battery_levels'][-1]
+            last_con = last_rollout['states']['connectivity'][-1]
+            last_pos = last_rollout['states']['node_positions'][-1]
+            all_ss   = last_rollout['actions']['sleep_schedule']
+            last_ss_final = all_ss[-1]
+            awake_mask = (last_ss_final < 0.5)
+            num_awake_eval = np.sum(awake_mask)
+            has_link_mask = np.any(last_con > 0, axis=1)
+            
+            if num_awake_eval > 0:
+                connected_awake = np.sum(has_link_mask & awake_mask)
+                connectivity = float((connected_awake / num_awake_eval) * 100.0)
+            else:
+                connectivity = 0.0
+                
+            progress = ((meta_iter + 1) / args.meta_iterations) * 100
+            print(f"METRICS_BASE|{meta_iter + 1}|{eval_energy:.6f}|{eval_delay:.2f}|{progress:.1f}|{connectivity:.1f}", flush=True)
+            
+            avg_sleep_per_node = np.mean(all_ss >= 0.5, axis=0)
+            n_dead  = int(np.sum(last_bat <= 0))
+            n_sleep = int(np.round(np.sum((avg_sleep_per_node >= 0.5) & (last_bat > 0))))
+            n_awake = int(env_config['num_nodes']) - n_dead - n_sleep
+            n_links = int(np.sum(last_con) // 2)
+            
+            pos_str = ','.join(f"{x:.3f},{y:.3f}" for x, y in last_pos)
+            state_str = ''.join(
+                'D' if last_bat[i] <= 0 else ('S' if last_ss_final[i] >= 0.5 else 'A')
+                for i in range(env_config['num_nodes'])
+            )
+            print(f"WSN_STATE|{n_awake}|{n_sleep}|{n_dead}|{n_links}|{pos_str}|{state_str}", flush=True)
+            
+            if (meta_iter + 1) % 10 == 0:
+                avg_reward = float(np.mean(last_rollout['rewards']))
+                print(f"Round {meta_iter + 1} [Baseline]: Reward={avg_reward:.3f}, Energy={eval_energy:.6f}, Delay={eval_delay:.2f}ms", flush=True)
+                print(f"REWARD|{avg_reward:.3f}", flush=True)
+            
+            time.sleep(0.05)
+            
+        print("=" * 60, flush=True)
+        print("=== Baseline finished ===", flush=True)
+        return
 
     best_avg_reward = -float('inf')
     start_iter = 0

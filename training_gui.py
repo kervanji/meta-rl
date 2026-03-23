@@ -280,6 +280,9 @@ class TrainingGUI:
         self.rounds = []
         self.energy_data = []
         self.delay_data = []
+        self.rounds_base = []
+        self.energy_data_base = []
+        self.delay_data_base = []
         self.reward_data = []
         self.connectivity_data = []
         
@@ -414,8 +417,14 @@ class TrainingGUI:
         self.btn_stop.pack(side='right', padx=5)
         self.btn_stop.set_enabled(False)
         
+        self.btn_baseline = ModernButton(right, "Run Baseline",
+                                      command=lambda: self.start_training(is_baseline=True),
+                                      bg_color='#8b5cf6', # purple color for baseline
+                                      width=110, height=34)
+        self.btn_baseline.pack(side='right', padx=5)
+        
         self.btn_start = ModernButton(right, "Start Training",
-                                      command=self.start_training,
+                                      command=lambda: self.start_training(is_baseline=False),
                                       bg_color=COLORS['accent_blue'],
                                       width=110, height=34)
         self.btn_start.pack(side='right', padx=5)
@@ -701,7 +710,12 @@ class TrainingGUI:
         for spine in self.ax_energy.spines.values():
             spine.set_color(COLORS['border'])
         self.line_energy, = self.ax_energy.plot([], [], color=COLORS['accent_cyan'],
-                                                 linewidth=2)
+                                                 linewidth=2, label='Meta-RL')
+        self.line_energy_base, = self.ax_energy.plot([], [], color='#a855f7',
+                                                 linewidth=2, linestyle='--', label='Baseline')
+        self.ax_energy.legend(loc='upper right', fontsize=8,
+                            facecolor=COLORS['chart_bg'], edgecolor=COLORS['border'],
+                            labelcolor=COLORS['text_primary'])
         
         self.ax_delay = self.fig.add_subplot(122)
         self.ax_delay.set_facecolor(COLORS['chart_bg'])
@@ -714,7 +728,12 @@ class TrainingGUI:
         for spine in self.ax_delay.spines.values():
             spine.set_color(COLORS['border'])
         self.line_delay, = self.ax_delay.plot([], [], color=COLORS['accent_orange'],
-                                               linewidth=2)
+                                               linewidth=2, label='Meta-RL')
+        self.line_delay_base, = self.ax_delay.plot([], [], color='#ec4899',
+                                               linewidth=2, linestyle='--', label='Baseline')
+        self.ax_delay.legend(loc='upper right', fontsize=8,
+                            facecolor=COLORS['chart_bg'], edgecolor=COLORS['border'],
+                            labelcolor=COLORS['text_primary'])
         
         self.fig.tight_layout(pad=1.5)
         
@@ -771,20 +790,28 @@ class TrainingGUI:
         self.canvas_hist.draw()
         self.canvas_hist.get_tk_widget().pack(side='left', fill='both', expand=True)
         
-    def update_charts(self, round_num, energy, delay):
-        # تطبيع رقم الجولة ليبدأ من 1 دائماً (مهم عند الاستئناف)
-        if not hasattr(self, '_round_offset') or self._round_offset is None:
-            self._round_offset = round_num - 1  # أول قيمة = 1 دائماً
-        display_round = round_num - self._round_offset
-        self.rounds.append(display_round)
-        self.energy_data.append(energy)
-        self.delay_data.append(delay)
+    def update_charts(self, round_num, energy, delay, is_baseline=False):
+        if is_baseline:
+            if not hasattr(self, '_round_offset_base') or self._round_offset_base is None:
+                self._round_offset_base = round_num - 1
+            display_round = round_num - self._round_offset_base
+            self.rounds_base.append(display_round)
+            self.energy_data_base.append(energy)
+            self.delay_data_base.append(delay)
+            self.line_energy_base.set_data(self.rounds_base, self.energy_data_base)
+            self.line_delay_base.set_data(self.rounds_base, self.delay_data_base)
+        else:
+            if not hasattr(self, '_round_offset') or self._round_offset is None:
+                self._round_offset = round_num - 1
+            display_round = round_num - self._round_offset
+            self.rounds.append(display_round)
+            self.energy_data.append(energy)
+            self.delay_data.append(delay)
+            self.line_energy.set_data(self.rounds, self.energy_data)
+            self.line_delay.set_data(self.rounds, self.delay_data)
 
-        self.line_energy.set_data(self.rounds, self.energy_data)
         self.ax_energy.relim()
         self.ax_energy.autoscale_view()
-
-        self.line_delay.set_data(self.rounds, self.delay_data)
         self.ax_delay.relim()
         self.ax_delay.autoscale_view()
 
@@ -854,13 +881,19 @@ class TrainingGUI:
         self.ax_hist.autoscale_view()
         self.canvas_hist.draw()
 
-    def clear_charts(self):
-        self.rounds = []
-        self.energy_data = []
-        self.delay_data = []
-        
-        self.line_energy.set_data([], [])
-        self.line_delay.set_data([], [])
+    def clear_charts(self, is_baseline=False):
+        if is_baseline:
+            self.rounds_base = []
+            self.energy_data_base = []
+            self.delay_data_base = []
+            self.line_energy_base.set_data([], [])
+            self.line_delay_base.set_data([], [])
+        else:
+            self.rounds = []
+            self.energy_data = []
+            self.delay_data = []
+            self.line_energy.set_data([], [])
+            self.line_delay.set_data([], [])
         
         self.ax_energy.relim()
         self.ax_energy.autoscale_view()
@@ -890,14 +923,16 @@ class TrainingGUI:
         self.ax_hist.autoscale_view()
         self.canvas_hist.draw()
         
-        # Reset baseline energy trackers for the new run
+        # Reset energy trackers for the new run
         self.initial_energy = None
         self.min_energy = None
         self.initial_delay = None
         self._energy_warmup_buf = []
 
-        # Reset round offset so chart always starts from 1
-        self._round_offset = None
+        if is_baseline:
+            self._round_offset_base = None
+        else:
+            self._round_offset = None
 
         # Reset metric cards
         self.update_metric_cards(0.0, 0.0, 0.0, 0.0)
@@ -1000,10 +1035,12 @@ class TrainingGUI:
             messagebox.showerror("Input Error", f"Invalid input values: {e}")
             return None
             
-    def start_training(self):
+    def start_training(self, is_baseline=False):
         config = self.validate_inputs()
         if config is None:
             return
+            
+        config['is_baseline'] = is_baseline
 
         # Ensure external script starts with forced-death disabled.
         force_death_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.force_death_pct')
@@ -1014,7 +1051,8 @@ class TrainingGUI:
             pass
 
         # إذا لم يكن الاستئناف مفعّلاً، نمسح الـ checkpoint القديم حتى يبدأ التدريب من الصفر بالقيم الجديدة
-        if not config.get('resume'):
+        # نمنع المسح أثناء عمل baseline لأن baseline لا ينبغي أن يحذف model
+        if not config.get('resume') and not is_baseline:
             ckpt_path = os.path.join(config['checkpoint_dir'], 'best_model.pt')
             if os.path.exists(ckpt_path):
                 try:
@@ -1025,10 +1063,12 @@ class TrainingGUI:
 
         self.is_training = True
         self.btn_start.set_enabled(False)
+        self.btn_baseline.set_enabled(False)
         self.btn_stop.set_enabled(True)
-        self.status_label.config(text="Training...")
-        self.status_dot.config(fg=COLORS['accent_orange'])
-        self.clear_charts()
+        
+        self.status_label.config(text="Running Baseline..." if is_baseline else "Training...")
+        self.status_dot.config(fg=COLORS['accent_cyan'] if is_baseline else COLORS['accent_orange'])
+        self.clear_charts(is_baseline=is_baseline)
         
         # Start training in a separate thread
         self.training_thread = threading.Thread(target=self.run_training, args=(config,), daemon=True)
@@ -1054,6 +1094,8 @@ class TrainingGUI:
         ]
         if config.get('resume'):
             cmd.append('--resume')
+        if config.get('is_baseline'):
+            cmd.append('--baseline')
 
         try:
             env = os.environ.copy()
@@ -1091,7 +1133,8 @@ class TrainingGUI:
                     return
                     
                 # Parse metrics line
-                if line.startswith("METRICS|"):
+                if line.startswith("METRICS|") or line.startswith("METRICS_BASE|"):
+                    is_base_metrics = line.startswith("METRICS_BASE|")
                     parts = line.strip().split("|")
                     if len(parts) >= 5:
                         round_num = int(parts[1])
@@ -1100,7 +1143,7 @@ class TrainingGUI:
                         progress = float(parts[4])
                         connectivity = float(parts[5]) if len(parts) > 5 else 0
 
-                        self.update_charts(round_num, energy, delay)
+                        self.update_charts(round_num, energy, delay, is_baseline=is_base_metrics)
                         self.update_metric_cards(energy=energy, delay=delay,
                                                 connectivity=connectivity)
                         # Update progress bar
@@ -1172,6 +1215,7 @@ class TrainingGUI:
     def training_finished(self):
         self.is_training = False
         self.btn_start.set_enabled(True)
+        self.btn_baseline.set_enabled(True)
         self.btn_stop.set_enabled(False)
         self.status_label.config(text="Idle")
         self.status_dot.config(fg=COLORS['accent_green'])
@@ -1185,6 +1229,7 @@ class TrainingGUI:
             self.training_process = None
             
         self.btn_start.set_enabled(True)
+        self.btn_baseline.set_enabled(True)
         self.btn_stop.set_enabled(False)
         self.status_label.config(text="Stopped")
         self.status_dot.config(fg='#ef4444')
