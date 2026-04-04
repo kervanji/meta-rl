@@ -417,16 +417,10 @@ class TrainingGUI:
         self.btn_stop.pack(side='right', padx=5)
         self.btn_stop.set_enabled(False)
         
-        self.btn_baseline = ModernButton(right, "Run Heuristic Baseline",
-                                      command=lambda: self.start_training(is_baseline=True),
-                                      bg_color='#8b5cf6', # purple color for baseline
-                                      width=170, height=34)
-        self.btn_baseline.pack(side='right', padx=5)
-        
-        self.btn_start = ModernButton(right, "Start Training",
-                                      command=lambda: self.start_training(is_baseline=False),
+        self.btn_start = ModernButton(right, "Start Meta-RL + Baseline",
+                                      command=self.start_training,
                                       bg_color=COLORS['accent_blue'],
-                                      width=110, height=34)
+                                      width=210, height=34)
         self.btn_start.pack(side='right', padx=5)
     
     def _create_sidebar(self, parent):
@@ -1035,12 +1029,10 @@ class TrainingGUI:
             messagebox.showerror("Input Error", f"Invalid input values: {e}")
             return None
             
-    def start_training(self, is_baseline=False):
+    def start_training(self):
         config = self.validate_inputs()
         if config is None:
             return
-            
-        config['is_baseline'] = is_baseline
 
         # Ensure external script starts with forced-death disabled.
         force_death_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.force_death_pct')
@@ -1052,7 +1044,7 @@ class TrainingGUI:
 
         # إذا لم يكن الاستئناف مفعّلاً، نمسح الـ checkpoint القديم حتى يبدأ التدريب من الصفر بالقيم الجديدة
         # نمنع المسح أثناء عمل baseline لأن baseline لا ينبغي أن يحذف model
-        if not config.get('resume') and not is_baseline:
+        if not config.get('resume'):
             ckpt_path = os.path.join(config['checkpoint_dir'], 'best_model.pt')
             if os.path.exists(ckpt_path):
                 try:
@@ -1062,13 +1054,14 @@ class TrainingGUI:
                     print(f"[GUI] Warning: could not delete checkpoint: {e}", flush=True)
 
         self.is_training = True
+        self.output_queue = queue.Queue()
         self.btn_start.set_enabled(False)
-        self.btn_baseline.set_enabled(False)
         self.btn_stop.set_enabled(True)
         
-        self.status_label.config(text="Running Heuristic Baseline..." if is_baseline else "Training...")
-        self.status_dot.config(fg=COLORS['accent_cyan'] if is_baseline else COLORS['accent_orange'])
-        self.clear_charts(is_baseline=is_baseline)
+        self.status_label.config(text="Running Meta-RL...")
+        self.status_dot.config(fg=COLORS['accent_orange'])
+        self.clear_charts(is_baseline=False)
+        self.clear_charts(is_baseline=True)
         
         # Start training in a separate thread
         self.training_thread = threading.Thread(target=self.run_training, args=(config,), daemon=True)
@@ -1094,8 +1087,7 @@ class TrainingGUI:
         ]
         if config.get('resume'):
             cmd.append('--resume')
-        if config.get('is_baseline'):
-            cmd.append('--baseline')
+        cmd.append('--baseline_after_training')
 
         try:
             env = os.environ.copy()
@@ -1149,6 +1141,11 @@ class TrainingGUI:
                         # Update progress bar
                         self.progress_var.set(progress)
                         self.progress_label.config(text=f"{progress:.1f}%")
+                elif "=== Running Heuristic Baseline ===" in line:
+                    self.status_label.config(text="Running Heuristic Baseline...")
+                    self.status_dot.config(fg=COLORS['accent_cyan'])
+                    self.terminal_output.insert(tk.END, line, 'green')
+                    self.terminal_output.see(tk.END)
                 elif line.startswith("WSN_STATE|"):
                     # WSN_STATE|n_awake|n_sleep|n_dead|n_links|pos_str|state_str
                     parts = line.strip().split("|")
@@ -1214,12 +1211,12 @@ class TrainingGUI:
     
     def training_finished(self):
         self.is_training = False
+        self.training_process = None
         self.btn_start.set_enabled(True)
-        self.btn_baseline.set_enabled(True)
         self.btn_stop.set_enabled(False)
         self.status_label.config(text="Idle")
         self.status_dot.config(fg=COLORS['accent_green'])
-        self.terminal_output.insert(tk.END, "\n=== Training Finished ===\n", 'green')
+        self.terminal_output.insert(tk.END, "\n=== Meta-RL + Baseline Finished ===\n", 'green')
         self.terminal_output.see(tk.END)
         
     def stop_training(self):
@@ -1229,7 +1226,6 @@ class TrainingGUI:
             self.training_process = None
             
         self.btn_start.set_enabled(True)
-        self.btn_baseline.set_enabled(True)
         self.btn_stop.set_enabled(False)
         self.status_label.config(text="Stopped")
         self.status_dot.config(fg='#ef4444')
