@@ -2,7 +2,6 @@ import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
 from typing import Dict, List, Tuple, Optional
-import matplotlib.pyplot as plt
 
 class WSNAbstractEnv(gym.Env):
     """فئة أساسية مجردة لبيئات شبكات الحساسات اللاسلكية (WSN)."""
@@ -206,6 +205,8 @@ class WSNAbstractEnv(gym.Env):
           - رمادي : نائمة (sleep_schedule == 1)
           - أحمر  : ميتة (battery <= 0)
         """
+        import matplotlib.pyplot as plt
+
         fig, ax = plt.subplots(figsize=(8, 8))
         ax.set_facecolor('#1a1a2e')
         fig.patch.set_facecolor('#1a1a2e')

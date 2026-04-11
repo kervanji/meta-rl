@@ -280,9 +280,9 @@ class TrainingGUI:
         self.rounds = []
         self.energy_data = []
         self.delay_data = []
-        self.rounds_base = []
-        self.energy_data_base = []
-        self.delay_data_base = []
+        self.rounds_fuzzy = []
+        self.energy_data_fuzzy = []
+        self.delay_data_fuzzy = []
         self.reward_data = []
         self.connectivity_data = []
         
@@ -417,10 +417,10 @@ class TrainingGUI:
         self.btn_stop.pack(side='right', padx=5)
         self.btn_stop.set_enabled(False)
         
-        self.btn_start = ModernButton(right, "Start Meta-RL + Baseline",
+        self.btn_start = ModernButton(right, "Start Meta-RL + Fuzzy Logic",
                                       command=self.start_training,
                                       bg_color=COLORS['accent_blue'],
-                                      width=210, height=34)
+                                      width=235, height=34)
         self.btn_start.pack(side='right', padx=5)
     
     def _create_sidebar(self, parent):
@@ -705,8 +705,8 @@ class TrainingGUI:
             spine.set_color(COLORS['border'])
         self.line_energy, = self.ax_energy.plot([], [], color=COLORS['accent_cyan'],
                                                  linewidth=2, label='Meta-RL')
-        self.line_energy_base, = self.ax_energy.plot([], [], color='#a855f7',
-                                                 linewidth=2, linestyle='--', label='Heuristic Baseline')
+        self.line_energy_fuzzy, = self.ax_energy.plot([], [], color='#a855f7',
+                                                  linewidth=2, linestyle='--', label='Fuzzy Logic')
         self.ax_energy.legend(loc='upper right', fontsize=8,
                             facecolor=COLORS['chart_bg'], edgecolor=COLORS['border'],
                             labelcolor=COLORS['text_primary'])
@@ -723,8 +723,8 @@ class TrainingGUI:
             spine.set_color(COLORS['border'])
         self.line_delay, = self.ax_delay.plot([], [], color=COLORS['accent_orange'],
                                                linewidth=2, label='Meta-RL')
-        self.line_delay_base, = self.ax_delay.plot([], [], color='#ec4899',
-                                               linewidth=2, linestyle='--', label='Heuristic Baseline')
+        self.line_delay_fuzzy, = self.ax_delay.plot([], [], color='#ec4899',
+                                                linewidth=2, linestyle='--', label='Fuzzy Logic')
         self.ax_delay.legend(loc='upper right', fontsize=8,
                             facecolor=COLORS['chart_bg'], edgecolor=COLORS['border'],
                             labelcolor=COLORS['text_primary'])
@@ -784,16 +784,16 @@ class TrainingGUI:
         self.canvas_hist.draw()
         self.canvas_hist.get_tk_widget().pack(side='left', fill='both', expand=True)
         
-    def update_charts(self, round_num, energy, delay, is_baseline=False):
-        if is_baseline:
-            if not hasattr(self, '_round_offset_base') or self._round_offset_base is None:
-                self._round_offset_base = round_num - 1
-            display_round = round_num - self._round_offset_base
-            self.rounds_base.append(display_round)
-            self.energy_data_base.append(energy)
-            self.delay_data_base.append(delay)
-            self.line_energy_base.set_data(self.rounds_base, self.energy_data_base)
-            self.line_delay_base.set_data(self.rounds_base, self.delay_data_base)
+    def update_charts(self, round_num, energy, delay, is_fuzzy=False):
+        if is_fuzzy:
+            if not hasattr(self, '_round_offset_fuzzy') or self._round_offset_fuzzy is None:
+                self._round_offset_fuzzy = round_num - 1
+            display_round = round_num - self._round_offset_fuzzy
+            self.rounds_fuzzy.append(display_round)
+            self.energy_data_fuzzy.append(energy)
+            self.delay_data_fuzzy.append(delay)
+            self.line_energy_fuzzy.set_data(self.rounds_fuzzy, self.energy_data_fuzzy)
+            self.line_delay_fuzzy.set_data(self.rounds_fuzzy, self.delay_data_fuzzy)
         else:
             if not hasattr(self, '_round_offset') or self._round_offset is None:
                 self._round_offset = round_num - 1
@@ -875,13 +875,13 @@ class TrainingGUI:
         self.ax_hist.autoscale_view()
         self.canvas_hist.draw()
 
-    def clear_charts(self, is_baseline=False):
-        if is_baseline:
-            self.rounds_base = []
-            self.energy_data_base = []
-            self.delay_data_base = []
-            self.line_energy_base.set_data([], [])
-            self.line_delay_base.set_data([], [])
+    def clear_charts(self, is_fuzzy=False):
+        if is_fuzzy:
+            self.rounds_fuzzy = []
+            self.energy_data_fuzzy = []
+            self.delay_data_fuzzy = []
+            self.line_energy_fuzzy.set_data([], [])
+            self.line_delay_fuzzy.set_data([], [])
         else:
             self.rounds = []
             self.energy_data = []
@@ -923,8 +923,8 @@ class TrainingGUI:
         self.initial_delay = None
         self._energy_warmup_buf = []
 
-        if is_baseline:
-            self._round_offset_base = None
+        if is_fuzzy:
+            self._round_offset_fuzzy = None
         else:
             self._round_offset = None
 
@@ -1042,8 +1042,8 @@ class TrainingGUI:
         except Exception:
             pass
 
-        # إذا لم يكن الاستئناف مفعّلاً، نمسح الـ checkpoint القديم حتى يبدأ التدريب من الصفر بالقيم الجديدة
-        # نمنع المسح أثناء عمل baseline لأن baseline لا ينبغي أن يحذف model
+        # إذا لم يكن الاستئناف مفعّلاً، نمسح الـ checkpoint القديم حتى يبدأ التدريب من الصفر بالقيم الجديدة.
+        # مسار المقارنة الضبابي لا يحتاج حذف النموذج؛ الحذف هنا يبقى مرتبطاً فقط ببدء تدريب Meta-RL من الصفر.
         if not config.get('resume'):
             ckpt_path = os.path.join(config['checkpoint_dir'], 'best_model.pt')
             if os.path.exists(ckpt_path):
@@ -1060,8 +1060,8 @@ class TrainingGUI:
         
         self.status_label.config(text="Running Meta-RL...")
         self.status_dot.config(fg=COLORS['accent_orange'])
-        self.clear_charts(is_baseline=False)
-        self.clear_charts(is_baseline=True)
+        self.clear_charts(is_fuzzy=False)
+        self.clear_charts(is_fuzzy=True)
         
         # Start training in a separate thread
         self.training_thread = threading.Thread(target=self.run_training, args=(config,), daemon=True)
@@ -1087,7 +1087,7 @@ class TrainingGUI:
         ]
         if config.get('resume'):
             cmd.append('--resume')
-        cmd.append('--baseline_after_training')
+        cmd.append('--fuzzy_after_training')
 
         try:
             env = os.environ.copy()
@@ -1125,8 +1125,8 @@ class TrainingGUI:
                     return
                     
                 # Parse metrics line
-                if line.startswith("METRICS|") or line.startswith("METRICS_BASE|"):
-                    is_base_metrics = line.startswith("METRICS_BASE|")
+                if line.startswith("METRICS|") or line.startswith("METRICS_FUZZY|"):
+                    is_fuzzy_metrics = line.startswith("METRICS_FUZZY|")
                     parts = line.strip().split("|")
                     if len(parts) >= 5:
                         round_num = int(parts[1])
@@ -1135,14 +1135,14 @@ class TrainingGUI:
                         progress = float(parts[4])
                         connectivity = float(parts[5]) if len(parts) > 5 else 0
 
-                        self.update_charts(round_num, energy, delay, is_baseline=is_base_metrics)
+                        self.update_charts(round_num, energy, delay, is_fuzzy=is_fuzzy_metrics)
                         self.update_metric_cards(energy=energy, delay=delay,
                                                 connectivity=connectivity)
                         # Update progress bar
                         self.progress_var.set(progress)
                         self.progress_label.config(text=f"{progress:.1f}%")
-                elif "=== Running Heuristic Baseline ===" in line:
-                    self.status_label.config(text="Running Heuristic Baseline...")
+                elif "=== Running Fuzzy Logic Comparison ===" in line:
+                    self.status_label.config(text="Running Fuzzy Logic...")
                     self.status_dot.config(fg=COLORS['accent_cyan'])
                     self.terminal_output.insert(tk.END, line, 'green')
                     self.terminal_output.see(tk.END)
@@ -1216,7 +1216,7 @@ class TrainingGUI:
         self.btn_stop.set_enabled(False)
         self.status_label.config(text="Idle")
         self.status_dot.config(fg=COLORS['accent_green'])
-        self.terminal_output.insert(tk.END, "\n=== Meta-RL + Baseline Finished ===\n", 'green')
+        self.terminal_output.insert(tk.END, "\n=== Meta-RL + Fuzzy Logic Finished ===\n", 'green')
         self.terminal_output.see(tk.END)
         
     def stop_training(self):

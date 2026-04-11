@@ -140,19 +140,57 @@ def collect_rollout(env, policy, max_steps=None, deterministic=True, fixed_init=
     }
 
 
-class RuleBasedPolicy:
+class FuzzyLogicPolicy:
     """
-    Heuristic baseline that uses battery, local density, and node centrality.
+    Deterministic fuzzy controller for the WSN comparison path.
 
-    It is deterministic during evaluation so the comparison against Meta-RL is
-    reproducible and not driven by baseline randomness.
+    The controller maps each node state into fuzzy memberships, applies a small
+    Sugeno-style rule base, and then derives:
+      1. a relay-importance score,
+      2. a sleep-desirability score,
+      3. a transmit-power level.
     """
 
-    def __init__(self, target_sleep_ratio=0.10, min_awake_ratio=0.70, exploration_noise=0.03, seed=42):
-        self.target_sleep_ratio = target_sleep_ratio
+    def __init__(
+        self,
+        min_awake_ratio=0.68,
+        max_sleep_ratio=0.22,
+        sleep_threshold=0.58,
+        exploration_noise=0.02,
+        seed=42,
+    ):
         self.min_awake_ratio = min_awake_ratio
+        self.max_sleep_ratio = max_sleep_ratio
+        self.sleep_threshold = sleep_threshold
         self.exploration_noise = exploration_noise
         self.rng = np.random.RandomState(seed)
+        self.power_bias = 0.0
+        self.sleep_bias = 0.0
+        self.energy_reference = None
+        self.delay_reference = None
+        self.density_gain = 1.0
+        self.degree_gain = 1.0
+        self.centrality_gain = 1.0
+        self.power_scale = 1.0
+        self.sleep_scale = 1.0
+        self._baseline_score = None
+        self._trial_param = None
+        self._trial_delta = 0.0
+        self._search_cursor = 0
+        self._tuning_params = {
+            'min_awake_ratio': {'step': 0.012, 'min_step': 0.004, 'max_step': 0.030, 'min': 0.55, 'max': 0.92, 'direction': 1.0},
+            'max_sleep_ratio': {'step': 0.010, 'min_step': 0.004, 'max_step': 0.025, 'min': 0.08, 'max': 0.30, 'direction': -1.0},
+            'sleep_threshold': {'step': 0.012, 'min_step': 0.004, 'max_step': 0.030, 'min': 0.42, 'max': 0.78, 'direction': 1.0},
+            'power_bias': {'step': 0.018, 'min_step': 0.006, 'max_step': 0.045, 'min': -0.08, 'max': 0.22, 'direction': 1.0},
+            'sleep_bias': {'step': 0.018, 'min_step': 0.006, 'max_step': 0.045, 'min': -0.18, 'max': 0.18, 'direction': -1.0},
+            'density_gain': {'step': 0.040, 'min_step': 0.015, 'max_step': 0.080, 'min': 0.80, 'max': 1.25, 'direction': 1.0},
+            'degree_gain': {'step': 0.040, 'min_step': 0.015, 'max_step': 0.080, 'min': 0.80, 'max': 1.25, 'direction': 1.0},
+            'centrality_gain': {'step': 0.040, 'min_step': 0.015, 'max_step': 0.080, 'min': 0.80, 'max': 1.25, 'direction': -1.0},
+            'power_scale': {'step': 0.035, 'min_step': 0.015, 'max_step': 0.070, 'min': 0.85, 'max': 1.20, 'direction': 1.0},
+            'sleep_scale': {'step': 0.035, 'min_step': 0.015, 'max_step': 0.070, 'min': 0.85, 'max': 1.20, 'direction': -1.0},
+        }
+        self._tuning_order = list(self._tuning_params.keys())
+        self._topology_cache = {}
 
     @staticmethod
     def _normalize(values):
@@ -165,32 +203,330 @@ class RuleBasedPolicy:
             return np.zeros_like(values, dtype=np.float32)
         return ((values - vmin) / (vmax - vmin)).astype(np.float32)
 
+    @staticmethod
+    def _triangular_vec(x, left, center, right):
+        x = np.asarray(x, dtype=np.float32)
+        result = np.zeros_like(x, dtype=np.float32)
+        left_mask = (x > left) & (x < center)
+        if center - left > 1e-8:
+            result[left_mask] = (x[left_mask] - left) / (center - left)
+        right_mask = (x > center) & (x < right)
+        if right - center > 1e-8:
+            result[right_mask] = (right - x[right_mask]) / (right - center)
+        result[np.isclose(x, center)] = 1.0
+        return result
+
+    @staticmethod
+    def _trapezoidal_vec(x, a, b, c, d):
+        x = np.asarray(x, dtype=np.float32)
+        result = np.zeros_like(x, dtype=np.float32)
+        plateau = (x >= b) & (x <= c)
+        result[plateau] = 1.0
+        rise = (x > a) & (x < b)
+        if b - a > 1e-8:
+            result[rise] = (x[rise] - a) / (b - a)
+        fall = (x > c) & (x < d)
+        if d - c > 1e-8:
+            result[fall] = (d - x[fall]) / (d - c)
+        return result
+
+    @staticmethod
+    def _triangular(x, left, center, right):
+        if x <= left or x >= right:
+            return 0.0
+        if x == center:
+            return 1.0
+        if x < center:
+            return float((x - left) / max(center - left, 1e-8))
+        return float((right - x) / max(right - center, 1e-8))
+
+    @staticmethod
+    def _trapezoidal(x, a, b, c, d):
+        if x <= a or x >= d:
+            return 0.0
+        if b <= x <= c:
+            return 1.0
+        if x < b:
+            return float((x - a) / max(b - a, 1e-8))
+        return float((d - x) / max(d - c, 1e-8))
+
+    @staticmethod
+    def _sugeno(rules, default_value):
+        active = [(strength, output) for strength, output in rules if strength > 1e-6]
+        if not active:
+            return float(default_value)
+        weights = np.array([strength for strength, _ in active], dtype=np.float32)
+        outputs = np.array([output for _, output in active], dtype=np.float32)
+        return float(np.dot(weights, outputs) / max(np.sum(weights), 1e-6))
+
+    @staticmethod
+    def _sugeno_vec(strengths, outputs, default_value):
+        strengths = np.asarray(strengths, dtype=np.float32)
+        outputs = np.asarray(outputs, dtype=np.float32)[:, np.newaxis]
+        weight_sum = np.sum(strengths, axis=0)
+        weighted = np.sum(strengths * outputs, axis=0)
+        return np.where(weight_sum > 1e-6, weighted / np.maximum(weight_sum, 1e-6), default_value).astype(np.float32)
+
+    @staticmethod
+    def _fuzzy_and(*values):
+        return float(np.minimum.reduce(np.asarray(values, dtype=np.float32)))
+
+    @staticmethod
+    def _fuzzy_and_vec(*values):
+        return np.minimum.reduce(np.asarray(values, dtype=np.float32))
+
+    @staticmethod
+    def _fuzzy_or(*values):
+        return float(np.maximum.reduce(np.asarray(values, dtype=np.float32)))
+
+    @staticmethod
+    def _fuzzy_or_vec(*values):
+        return np.maximum.reduce(np.asarray(values, dtype=np.float32))
+
+    def _memberships(self, battery, density, degree, centrality):
+        battery_low = self._trapezoidal(battery, 0.00, 0.00, 0.20, 0.45)
+        battery_medium = self._triangular(battery, 0.25, 0.50, 0.75)
+        battery_high = self._trapezoidal(battery, 0.55, 0.75, 1.00, 1.00)
+
+        density_sparse = self._trapezoidal(density, 0.00, 0.00, 0.18, 0.42)
+        density_balanced = self._triangular(density, 0.22, 0.50, 0.78)
+        density_dense = self._trapezoidal(density, 0.58, 0.78, 1.00, 1.00)
+
+        degree_weak = self._trapezoidal(degree, 0.00, 0.00, 0.18, 0.42)
+        degree_good = self._triangular(degree, 0.22, 0.50, 0.78)
+        degree_strong = self._trapezoidal(degree, 0.58, 0.78, 1.00, 1.00)
+
+        centrality_edge = self._trapezoidal(centrality, 0.00, 0.00, 0.20, 0.45)
+        centrality_mid = self._triangular(centrality, 0.25, 0.50, 0.75)
+        centrality_core = self._trapezoidal(centrality, 0.55, 0.75, 1.00, 1.00)
+
+        return {
+            'battery_low': battery_low,
+            'battery_medium': battery_medium,
+            'battery_high': battery_high,
+            'density_sparse': density_sparse,
+            'density_balanced': density_balanced,
+            'density_dense': density_dense,
+            'degree_weak': degree_weak,
+            'degree_good': degree_good,
+            'degree_strong': degree_strong,
+            'centrality_edge': centrality_edge,
+            'centrality_mid': centrality_mid,
+            'centrality_core': centrality_core,
+        }
+
+    def _memberships_vec(self, battery, density, degree, centrality):
+        return {
+            'battery_low': self._trapezoidal_vec(battery, 0.00, 0.00, 0.20, 0.45),
+            'battery_medium': self._triangular_vec(battery, 0.25, 0.50, 0.75),
+            'battery_high': self._trapezoidal_vec(battery, 0.55, 0.75, 1.00, 1.00),
+            'density_sparse': self._trapezoidal_vec(density, 0.00, 0.00, 0.18, 0.42),
+            'density_balanced': self._triangular_vec(density, 0.22, 0.50, 0.78),
+            'density_dense': self._trapezoidal_vec(density, 0.58, 0.78, 1.00, 1.00),
+            'degree_weak': self._trapezoidal_vec(degree, 0.00, 0.00, 0.18, 0.42),
+            'degree_good': self._triangular_vec(degree, 0.22, 0.50, 0.78),
+            'degree_strong': self._trapezoidal_vec(degree, 0.58, 0.78, 1.00, 1.00),
+            'centrality_edge': self._trapezoidal_vec(centrality, 0.00, 0.00, 0.20, 0.45),
+            'centrality_mid': self._triangular_vec(centrality, 0.25, 0.50, 0.75),
+            'centrality_core': self._trapezoidal_vec(centrality, 0.55, 0.75, 1.00, 1.00),
+        }
+
+    def _evaluate_nodes(self, battery, density, degree, centrality):
+        density = np.clip(np.asarray(density, dtype=np.float32) * self.density_gain, 0.0, 1.0)
+        degree = np.clip(np.asarray(degree, dtype=np.float32) * self.degree_gain, 0.0, 1.0)
+        centrality = np.clip(np.asarray(centrality, dtype=np.float32) * self.centrality_gain, 0.0, 1.0)
+        battery = np.asarray(battery, dtype=np.float32)
+
+        m = self._memberships_vec(battery, density, degree, centrality)
+
+        relay_importance = self._sugeno_vec(np.stack([
+            self._fuzzy_and_vec(m['battery_high'], m['degree_strong']),
+            self._fuzzy_and_vec(m['battery_high'], m['centrality_core']),
+            self._fuzzy_and_vec(m['degree_good'], m['centrality_core']),
+            self._fuzzy_and_vec(m['density_sparse'], m['battery_high']),
+            self._fuzzy_and_vec(m['density_sparse'], m['degree_good']),
+            self._fuzzy_and_vec(m['battery_medium'], m['degree_good']),
+            self._fuzzy_and_vec(m['density_dense'], m['centrality_edge']),
+            self._fuzzy_and_vec(m['battery_low'], m['degree_weak']),
+        ], axis=0), np.array([0.98, 0.90, 0.82, 0.86, 0.78, 0.62, 0.20, 0.10], dtype=np.float32), 0.48)
+
+        sleep_desirability = self._sugeno_vec(np.stack([
+            self._fuzzy_and_vec(m['battery_low'], m['density_dense'], m['degree_strong']),
+            self._fuzzy_and_vec(m['battery_low'], m['centrality_edge']),
+            self._fuzzy_and_vec(m['density_dense'], m['centrality_edge']),
+            self._fuzzy_and_vec(m['battery_medium'], m['density_dense'], m['degree_good']),
+            self._fuzzy_and_vec(m['battery_low'], m['density_balanced']),
+            self._fuzzy_and_vec(m['battery_high'], m['density_sparse']),
+            self._fuzzy_or_vec(m['centrality_core'], m['degree_weak']),
+            self._fuzzy_and_vec(m['battery_high'], m['centrality_core']),
+        ], axis=0), np.array([0.96, 0.88, 0.82, 0.72, 0.74, 0.05, 0.08, 0.03], dtype=np.float32), 0.40)
+
+        transmit_power = self._sugeno_vec(np.stack([
+            self._fuzzy_and_vec(m['degree_weak'], m['density_sparse']),
+            self._fuzzy_and_vec(m['degree_weak'], m['battery_high']),
+            self._fuzzy_and_vec(m['degree_weak'], m['battery_medium']),
+            self._fuzzy_and_vec(m['centrality_edge'], m['density_sparse']),
+            self._fuzzy_and_vec(m['centrality_core'], m['degree_good']),
+            self._fuzzy_and_vec(m['battery_low'], m['degree_strong']),
+            self._fuzzy_and_vec(m['degree_strong'], m['density_dense']),
+            self._fuzzy_and_vec(m['battery_medium'], m['degree_good']),
+            self._fuzzy_and_vec(m['battery_high'], m['density_dense']),
+        ], axis=0), np.array([1.00, 0.92, 0.84, 0.88, 0.58, 0.42, 0.36, 0.62, 0.52], dtype=np.float32), 0.64)
+
+        sleep_desirability = np.clip(sleep_desirability * self.sleep_scale + self.sleep_bias, 0.0, 1.0)
+        transmit_power = np.clip(transmit_power * self.power_scale + self.power_bias, 0.35, 1.0)
+
+        return relay_importance.astype(np.float32), sleep_desirability.astype(np.float32), transmit_power.astype(np.float32)
+
+    def _get_topology_features(self, positions):
+        topo_key = positions.astype(np.float32, copy=False).tobytes()
+        cached = self._topology_cache.get(topo_key)
+        if cached is not None:
+            return cached
+
+        diff = positions[:, np.newaxis, :] - positions[np.newaxis, :, :]
+        dist_full = np.sqrt(np.sum(diff ** 2, axis=-1)).astype(np.float32)
+        np.fill_diagonal(dist_full, np.inf)
+        cached = {'dist_full': dist_full}
+        self._topology_cache = {topo_key: cached}
+        return cached
+
+    def _evaluate_node(self, battery, density, degree, centrality):
+        density = float(np.clip(density * self.density_gain, 0.0, 1.0))
+        degree = float(np.clip(degree * self.degree_gain, 0.0, 1.0))
+        centrality = float(np.clip(centrality * self.centrality_gain, 0.0, 1.0))
+        m = self._memberships(battery, density, degree, centrality)
+
+        relay_importance = self._sugeno([
+            (self._fuzzy_and(m['battery_high'], m['degree_strong']), 0.98),
+            (self._fuzzy_and(m['battery_high'], m['centrality_core']), 0.90),
+            (self._fuzzy_and(m['degree_good'], m['centrality_core']), 0.82),
+            (self._fuzzy_and(m['density_sparse'], m['battery_high']), 0.86),
+            (self._fuzzy_and(m['density_sparse'], m['degree_good']), 0.78),
+            (self._fuzzy_and(m['battery_medium'], m['degree_good']), 0.62),
+            (self._fuzzy_and(m['density_dense'], m['centrality_edge']), 0.20),
+            (self._fuzzy_and(m['battery_low'], m['degree_weak']), 0.10),
+        ], default_value=0.48)
+
+        sleep_desirability = self._sugeno([
+            (self._fuzzy_and(m['battery_low'], m['density_dense'], m['degree_strong']), 0.96),
+            (self._fuzzy_and(m['battery_low'], m['centrality_edge']), 0.88),
+            (self._fuzzy_and(m['density_dense'], m['centrality_edge']), 0.82),
+            (self._fuzzy_and(m['battery_medium'], m['density_dense'], m['degree_good']), 0.72),
+            (self._fuzzy_and(m['battery_low'], m['density_balanced']), 0.74),
+            (self._fuzzy_and(m['battery_high'], m['density_sparse']), 0.05),
+            (self._fuzzy_or(m['centrality_core'], m['degree_weak']), 0.08),
+            (self._fuzzy_and(m['battery_high'], m['centrality_core']), 0.03),
+        ], default_value=0.40)
+
+        transmit_power = self._sugeno([
+            (self._fuzzy_and(m['degree_weak'], m['density_sparse']), 1.00),
+            (self._fuzzy_and(m['degree_weak'], m['battery_high']), 0.92),
+            (self._fuzzy_and(m['degree_weak'], m['battery_medium']), 0.84),
+            (self._fuzzy_and(m['centrality_edge'], m['density_sparse']), 0.88),
+            (self._fuzzy_and(m['centrality_core'], m['degree_good']), 0.58),
+            (self._fuzzy_and(m['battery_low'], m['degree_strong']), 0.42),
+            (self._fuzzy_and(m['degree_strong'], m['density_dense']), 0.36),
+            (self._fuzzy_and(m['battery_medium'], m['degree_good']), 0.62),
+            (self._fuzzy_and(m['battery_high'], m['density_dense']), 0.52),
+        ], default_value=0.64)
+
+        sleep_desirability = float(np.clip(sleep_desirability * self.sleep_scale + self.sleep_bias, 0.0, 1.0))
+        transmit_power = float(np.clip(transmit_power * self.power_scale + self.power_bias, 0.35, 1.0))
+
+        return relay_importance, sleep_desirability, transmit_power
+
+    def _round_score(self, avg_energy, avg_delay, connectivity_pct, sleep_ratio, avg_reward):
+        if self.energy_reference is None:
+            self.energy_reference = float(avg_energy)
+        if self.delay_reference is None:
+            self.delay_reference = float(avg_delay)
+
+        connectivity = float(connectivity_pct) / 100.0
+        sleep_ratio = float(np.clip(sleep_ratio, 0.0, 1.0))
+        energy_gain = float(np.clip(self.energy_reference / max(float(avg_energy), 1e-8), 0.6, 1.6))
+        delay_gain = float(np.clip(self.delay_reference / max(float(avg_delay), 1e-8), 0.6, 1.6))
+        sleep_target = 0.18
+        sleep_balance = max(0.0, 1.0 - abs(sleep_ratio - sleep_target) / sleep_target)
+
+        return (
+            0.58 * float(avg_reward) +
+            0.16 * connectivity +
+            0.10 * (energy_gain / 1.6) +
+            0.10 * (delay_gain / 1.6) +
+            0.06 * sleep_balance
+        )
+
+    def _apply_tuning_delta(self, name, delta):
+        spec = self._tuning_params[name]
+        current = float(getattr(self, name))
+        updated = float(np.clip(current + delta, spec['min'], spec['max']))
+        setattr(self, name, updated)
+        return updated - current
+
+    def _schedule_next_trial(self):
+        for _ in range(len(self._tuning_order)):
+            name = self._tuning_order[self._search_cursor]
+            self._search_cursor = (self._search_cursor + 1) % len(self._tuning_order)
+            spec = self._tuning_params[name]
+            desired_delta = spec['direction'] * spec['step']
+            actual_delta = self._apply_tuning_delta(name, desired_delta)
+            if abs(actual_delta) > 1e-6:
+                self._trial_param = name
+                self._trial_delta = actual_delta
+                return
+            spec['direction'] *= -1.0
+
+        self._trial_param = None
+        self._trial_delta = 0.0
+
+    def adapt_controller(self, avg_energy, avg_delay, connectivity_pct, sleep_ratio, avg_reward):
+        score = self._round_score(avg_energy, avg_delay, connectivity_pct, sleep_ratio, avg_reward)
+
+        if self._baseline_score is None:
+            self._baseline_score = score
+            self._schedule_next_trial()
+            return
+
+        if self._trial_param is not None:
+            spec = self._tuning_params[self._trial_param]
+            if score >= self._baseline_score + 1e-4:
+                self._baseline_score = score
+                spec['step'] = min(spec['step'] * 1.04, spec['max_step'])
+            elif score <= self._baseline_score - 1e-4:
+                spec['direction'] *= -1.0
+                spec['step'] = max(spec['step'] * 0.92, spec['min_step'])
+                self._baseline_score = score
+            else:
+                spec['step'] = min(spec['step'] * 1.01, spec['max_step'])
+                self._baseline_score = score
+
+        self._schedule_next_trial()
+
     def get_action(self, state, deterministic=True):
         positions = state['node_positions']
         batteries = state['battery_levels'].astype(np.float32, copy=False)
         connectivity = state['connectivity']
-        N = batteries.shape[0]
+        num_nodes = batteries.shape[0]
 
-        tp = np.zeros(N, dtype=np.float32)
-        ss = np.ones(N, dtype=np.float32)
+        transmit_power = np.zeros(num_nodes, dtype=np.float32)
+        sleep_schedule = np.ones(num_nodes, dtype=np.float32)
 
         alive_mask = batteries > 0
         alive_indices = np.flatnonzero(alive_mask)
         alive_count = int(alive_indices.size)
 
         if alive_count == 0:
-            return {'transmit_power': tp, 'sleep_schedule': ss}
+            return {'transmit_power': transmit_power, 'sleep_schedule': sleep_schedule}
 
         alive_positions = positions[alive_mask]
         alive_batteries = batteries[alive_mask]
+        topo_features = self._get_topology_features(positions)
 
-        # تقدير كثافة الجوار هندسياً حتى لا يعتمد baseline على العشوائية.
         if alive_count > 1:
-            diff = alive_positions[:, np.newaxis, :] - alive_positions[np.newaxis, :, :]
-            dist = np.sqrt(np.sum(diff ** 2, axis=-1))
-            np.fill_diagonal(dist, np.inf)
+            dist = topo_features['dist_full'][np.ix_(alive_mask, alive_mask)]
 
-            k = min(3, alive_count - 1)
+            k = min(4, alive_count - 1)
             nearest = np.partition(dist, kth=k - 1, axis=1)[:, :k]
             mean_nearest = nearest.mean(axis=1)
             density = 1.0 - self._normalize(mean_nearest)
@@ -207,81 +543,60 @@ class RuleBasedPolicy:
             centrality = np.ones(1, dtype=np.float32)
             degree_norm = np.ones(1, dtype=np.float32)
 
-        # عقد ذات بطارية جيدة وكثافة/مركزية أعلى تُفضَّل للبقاء مستيقظة كعقد relay.
-        relay_score = (
-            0.45 * alive_batteries +
-            0.20 * degree_norm +
-            0.20 * density +
-            0.15 * centrality
-        )
-        # العقد منخفضة البطارية وعالية التكرار المروري مرشحة للنوم.
-        sleep_score = (
-            0.55 * (1.0 - alive_batteries) +
-            0.30 * density +
-            0.15 * (1.0 - centrality)
+        relay_scores, sleep_scores, power_levels = self._evaluate_nodes(
+            battery=alive_batteries,
+            density=density,
+            degree=degree_norm,
+            centrality=centrality,
         )
 
         min_awake = min(alive_count, max(3, int(np.ceil(self.min_awake_ratio * alive_count))))
-        target_sleep = min(
+        max_sleep_budget = min(
             max(0, alive_count - min_awake),
-            int(np.floor(self.target_sleep_ratio * alive_count))
+            int(np.floor(self.max_sleep_ratio * alive_count)),
         )
 
-        ss_alive = np.zeros(alive_count, dtype=np.float32)
-        if target_sleep > 0:
-            relay_cutoff = np.quantile(relay_score, 0.70) if alive_count > 1 else relay_score[0]
-            top_relay_cutoff = np.quantile(relay_score, 0.85) if alive_count > 1 else relay_score[0]
-            candidate_order = np.argsort(-sleep_score)
+        sleep_alive = np.zeros(alive_count, dtype=np.float32)
+        if max_sleep_budget > 0:
+            sleep_margin = sleep_scores - relay_scores
+            candidate_order = np.argsort(-sleep_margin)
             slept = 0
 
             for idx in candidate_order:
-                if slept >= target_sleep:
+                if slept >= max_sleep_budget:
                     break
-                if relay_score[idx] >= relay_cutoff or degree_norm[idx] < 0.35:
+                if sleep_scores[idx] < self.sleep_threshold:
                     continue
-                ss_alive[idx] = 1.0
+                if sleep_margin[idx] < 0.12:
+                    continue
+                if relay_scores[idx] > 0.55:
+                    continue
+                if degree_norm[idx] < 0.22 and density[idx] < 0.35:
+                    continue
+                sleep_alive[idx] = 1.0
                 slept += 1
 
-            if slept < target_sleep:
-                for idx in candidate_order:
-                    if slept >= target_sleep:
-                        break
-                    if ss_alive[idx] > 0.5 or relay_score[idx] >= top_relay_cutoff:
-                        continue
-                    ss_alive[idx] = 1.0
-                    slept += 1
-
-        tp_alive = (
-            0.55 +
-            0.25 * (1.0 - density) +
-            0.15 * (1.0 - degree_norm) +
-            0.05 * centrality
-        )
-        tp_alive -= np.where(alive_batteries < 0.30, 0.10, 0.0).astype(np.float32)
-        tp_alive += np.where((degree_norm < 0.25) | (centrality < 0.35), 0.10, 0.0).astype(np.float32)
-        tp_alive = np.clip(tp_alive, 0.35, 1.0)
-
         if not deterministic:
-            tp_alive = np.clip(
-                tp_alive + self.rng.uniform(-self.exploration_noise, self.exploration_noise, size=alive_count),
+            power_levels = np.clip(
+                power_levels + self.rng.uniform(-self.exploration_noise, self.exploration_noise, size=alive_count),
                 0.35,
-                1.0
+                1.0,
             )
 
-        tp_alive[ss_alive > 0.5] = 0.0
+        power_levels[sleep_alive > 0.5] = 0.0
 
-        tp[alive_indices] = tp_alive.astype(np.float32, copy=False)
-        ss[alive_indices] = ss_alive
+        transmit_power[alive_indices] = power_levels.astype(np.float32, copy=False)
+        sleep_schedule[alive_indices] = sleep_alive
 
         return {
-            'transmit_power': tp,
-            'sleep_schedule': ss
+            'transmit_power': transmit_power,
+            'sleep_schedule': sleep_schedule,
         }
 
 
-def run_heuristic_baseline(args, env_config, eval_tasks):
-    print("=== Running Heuristic Baseline ===", flush=True)
-    baseline_policy = RuleBasedPolicy(target_sleep_ratio=0.10, min_awake_ratio=0.70, seed=42)
+def run_fuzzy_logic_comparison(args, env_config, eval_tasks):
+    print("=== Running Fuzzy Logic Comparison ===", flush=True)
+    fuzzy_policy = FuzzyLogicPolicy(min_awake_ratio=0.68, max_sleep_ratio=0.22, seed=42)
 
     for meta_iter in range(args.meta_iterations):
         force_death_pct = read_force_death_pct()
@@ -302,7 +617,7 @@ def run_heuristic_baseline(args, env_config, eval_tasks):
 
             _er = collect_rollout(
                 _et['env'],
-                baseline_policy,
+                fuzzy_policy,
                 env_config['max_steps'],
                 deterministic=True,
                 fixed_init=eval_init
@@ -313,6 +628,7 @@ def run_heuristic_baseline(args, env_config, eval_tasks):
 
         eval_energy = float(np.mean(_eval_energies))
         eval_delay = float(np.mean(_eval_delays))
+        avg_reward = float(np.mean([np.mean(_rollout['rewards']) for _rollout in _eval_rollouts]))
 
         last_rollout = _eval_rollouts[0]
         last_bat = last_rollout['states']['battery_levels'][-1]
@@ -332,11 +648,12 @@ def run_heuristic_baseline(args, env_config, eval_tasks):
 
         progress = ((meta_iter + 1) / args.meta_iterations) * 100
         print(
-            f"METRICS_BASE|{meta_iter + 1}|{eval_energy:.6f}|{eval_delay:.2f}|{progress:.1f}|{connectivity:.1f}",
+            f"METRICS_FUZZY|{meta_iter + 1}|{eval_energy:.6f}|{eval_delay:.2f}|{progress:.1f}|{connectivity:.1f}",
             flush=True
         )
 
         avg_sleep_per_node = np.mean(all_ss >= 0.5, axis=0)
+        avg_sleep_ratio = float(np.mean(all_ss >= 0.5))
         n_dead = int(np.sum(last_bat <= 0))
         n_sleep = int(np.round(np.sum((avg_sleep_per_node >= 0.5) & (last_bat > 0))))
         n_awake = int(env_config['num_nodes']) - n_dead - n_sleep
@@ -350,17 +667,24 @@ def run_heuristic_baseline(args, env_config, eval_tasks):
         print(f"WSN_STATE|{n_awake}|{n_sleep}|{n_dead}|{n_links}|{pos_str}|{state_str}", flush=True)
 
         if (meta_iter + 1) % 10 == 0:
-            avg_reward = float(np.mean(last_rollout['rewards']))
             print(
-                f"Round {meta_iter + 1} [Heuristic Baseline]: Reward={avg_reward:.3f}, Energy={eval_energy:.6f}, Delay={eval_delay:.2f}ms",
+                f"Round {meta_iter + 1} [Fuzzy Logic]: Reward={avg_reward:.3f}, Energy={eval_energy:.6f}, Delay={eval_delay:.2f}ms",
                 flush=True
             )
             print(f"REWARD|{avg_reward:.3f}", flush=True)
 
+        fuzzy_policy.adapt_controller(
+            avg_energy=eval_energy,
+            avg_delay=eval_delay,
+            connectivity_pct=connectivity,
+            sleep_ratio=avg_sleep_ratio,
+            avg_reward=avg_reward,
+        )
+
         time.sleep(0.05)
 
     print("=" * 60, flush=True)
-    print("=== Heuristic baseline finished ===", flush=True)
+    print("=== Fuzzy Logic comparison finished ===", flush=True)
 
 def main():
     parser = argparse.ArgumentParser()
@@ -374,8 +698,8 @@ def main():
     parser.add_argument('--checkpoint_dir', type=str, default='checkpoints')
     parser.add_argument('--resume', action='store_true', default=False)
     parser.add_argument('--device', type=str, default='auto', choices=['auto', 'cuda', 'cpu'])
-    parser.add_argument('--baseline', action='store_true', default=False)
-    parser.add_argument('--baseline_after_training', action='store_true', default=False)
+    parser.add_argument('--fuzzy', action='store_true', default=False)
+    parser.add_argument('--fuzzy_after_training', action='store_true', default=False)
     args = parser.parse_args()
 
     if not args.resume:
@@ -450,8 +774,8 @@ def main():
     np.random.set_state(_rng_state)
     # -----------------------------------------------------------------------
 
-    if args.baseline:
-        run_heuristic_baseline(args, env_config, _eval_tasks)
+    if args.fuzzy:
+        run_fuzzy_logic_comparison(args, env_config, _eval_tasks)
         return
 
     best_avg_reward = -float('inf')
@@ -584,8 +908,8 @@ def main():
     print("=" * 60, flush=True)
     print("=== Training finished ===", flush=True)
 
-    if args.baseline_after_training:
-        run_heuristic_baseline(args, env_config, _eval_tasks)
+    if args.fuzzy_after_training:
+        run_fuzzy_logic_comparison(args, env_config, _eval_tasks)
 
 
 if __name__ == "__main__":
