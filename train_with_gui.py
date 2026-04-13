@@ -52,6 +52,46 @@ def read_force_death_pct():
     return 0
 
 
+def _fuzzy_resume_signal_path():
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), '.continue_to_fuzzy')
+
+
+def reset_fuzzy_resume_signal():
+    try:
+        fpath = _fuzzy_resume_signal_path()
+        if os.path.exists(fpath):
+            os.remove(fpath)
+    except Exception:
+        pass
+
+
+def wait_for_fuzzy_resume_signal(poll_interval=0.2):
+    fpath = _fuzzy_resume_signal_path()
+    print("META_RL_DONE_WAITING_FOR_FUZZY_CONFIRM", flush=True)
+    while True:
+        try:
+            if os.path.exists(fpath):
+                with open(fpath, 'r') as f:
+                    signal = f.read().strip().lower()
+                if signal == 'ok':
+                    os.remove(fpath)
+                    print("FUZZY_CONFIRM_RECEIVED", flush=True)
+                    return
+        except Exception:
+            pass
+        time.sleep(poll_interval)
+
+
+def resolve_resume_checkpoint(checkpoint_dir):
+    latest_path = os.path.join(checkpoint_dir, 'latest_model.pt')
+    best_path = os.path.join(checkpoint_dir, 'best_model.pt')
+    if os.path.exists(latest_path):
+        return latest_path
+    if os.path.exists(best_path):
+        return best_path
+    return best_path
+
+
 def collect_rollout(env, policy, max_steps=None, deterministic=True, fixed_init=None):
     if max_steps is None:
         max_steps = 200
@@ -729,6 +769,7 @@ def main():
     }
 
     os.makedirs(args.checkpoint_dir, exist_ok=True)
+    reset_fuzzy_resume_signal()
 
     print(f"Starting training with {args.num_nodes} nodes on DEVICE: {device.upper()}", flush=True)
     print(f"Meta iterations: {args.meta_iterations}, Batch size: {args.meta_batch}", flush=True)
@@ -780,19 +821,37 @@ def main():
 
     best_avg_reward = -float('inf')
     start_iter = 0
+    target_meta_iterations = args.meta_iterations
 
     if args.resume:
-        ckpt_path = os.path.join(args.checkpoint_dir, 'best_model.pt')
+        ckpt_path = resolve_resume_checkpoint(args.checkpoint_dir)
         if os.path.exists(ckpt_path):
             start_iter, best_avg_reward = agent.load(ckpt_path)
             print(f"Resumed from checkpoint: {ckpt_path} (iteration {start_iter}, best reward {best_avg_reward:.3f})", flush=True)
+            if start_iter >= target_meta_iterations:
+                target_meta_iterations = start_iter + args.meta_iterations
+                print(
+                    "Requested meta_iterations is not above the checkpoint iteration, "
+                    f"so resume will continue for {args.meta_iterations} extra rounds "
+                    f"(target iteration {target_meta_iterations}).",
+                    flush=True,
+                )
+            else:
+                remaining_rounds = target_meta_iterations - start_iter
+                print(
+                    f"Resume will continue until total iteration {target_meta_iterations} "
+                    f"({remaining_rounds} rounds remaining in this run).",
+                    flush=True,
+                )
         else:
             print(f"No checkpoint found at {ckpt_path}, starting fresh.", flush=True)
 
     # ضبط وضع policy للتدريب مرة واحدة قبل الحلقة
     policy.train()
 
-    for meta_iter in range(start_iter, args.meta_iterations):
+    session_total_iterations = max(target_meta_iterations - start_iter, 1)
+
+    for meta_iter in range(start_iter, target_meta_iterations):
         # قراءة نسبة الموت الإجباري من الواجهة (قابلة للتغيير أثناء التدريب)
         force_death_pct = read_force_death_pct()
 
@@ -871,7 +930,8 @@ def main():
         else:
             connectivity = 0.0
 
-        progress = ((meta_iter + 1) / args.meta_iterations) * 100
+        session_iter = (meta_iter - start_iter) + 1
+        progress = (session_iter / session_total_iterations) * 100
         # تقرير مقاييس التقييم الثابت للرسوم البيانية (ينعدم ضوضاء الطبولوجيا)
         print(f"METRICS|{meta_iter + 1}|{eval_energy:.6f}|{eval_delay:.2f}|{progress:.1f}|{connectivity:.1f}", flush=True)
 
@@ -895,6 +955,8 @@ def main():
         if (meta_iter + 1) % 10 == 0:
             # استخدام بيانات rollout الموجودة بدلاً من تشغيل eval إضافي
             avg_reward = float(np.mean(task_data[-1]['rewards']))
+            latest_path = os.path.join(args.checkpoint_dir, 'latest_model.pt')
+            agent.save(latest_path, meta_iter=meta_iter + 1, best_avg_reward=best_avg_reward)
 
             print(f"Round {meta_iter + 1}: Loss={meta_loss:.6f}, Reward={avg_reward:.3f}, Energy={avg_energy:.6f}, Delay={avg_delay:.2f}ms", flush=True)
             print(f"REWARD|{avg_reward:.3f}", flush=True)
@@ -905,10 +967,15 @@ def main():
                 agent.save(save_path, meta_iter=meta_iter + 1, best_avg_reward=best_avg_reward)
                 print(f"New best model saved! Reward: {avg_reward:.3f}", flush=True)
 
+    final_latest_path = os.path.join(args.checkpoint_dir, 'latest_model.pt')
+    agent.save(final_latest_path, meta_iter=target_meta_iterations, best_avg_reward=best_avg_reward)
+    print(f"Latest checkpoint saved at iteration {target_meta_iterations}", flush=True)
+
     print("=" * 60, flush=True)
     print("=== Training finished ===", flush=True)
 
     if args.fuzzy_after_training:
+        wait_for_fuzzy_resume_signal()
         run_fuzzy_logic_comparison(args, env_config, _eval_tasks)
 
 

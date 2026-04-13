@@ -290,6 +290,7 @@ class TrainingGUI:
         self.training_process = None
         self.is_training = False
         self.output_queue = queue.Queue()
+        self.waiting_for_fuzzy_confirmation = False
         
         # Current metrics
         self.current_reward = 0.0
@@ -315,6 +316,66 @@ class TrainingGUI:
         self.setup_styles()
         self.setup_ui()
         self.setup_charts()
+
+    def _fuzzy_resume_signal_path(self):
+        return os.path.join(os.path.dirname(os.path.abspath(__file__)), '.continue_to_fuzzy')
+
+    def _reset_fuzzy_resume_signal(self):
+        try:
+            fpath = self._fuzzy_resume_signal_path()
+            if os.path.exists(fpath):
+                os.remove(fpath)
+        except Exception:
+            pass
+
+    def _send_fuzzy_resume_signal(self):
+        try:
+            with open(self._fuzzy_resume_signal_path(), 'w') as f:
+                f.write('ok')
+        except Exception as e:
+            self.terminal_output.insert(tk.END, f"\n[GUI] Error sending fuzzy confirmation: {e}\n", 'red')
+            self.terminal_output.see(tk.END)
+
+    def _prompt_to_continue_fuzzy(self):
+        if self.waiting_for_fuzzy_confirmation:
+            return
+
+        self.waiting_for_fuzzy_confirmation = True
+        self.status_label.config(text="Meta-RL finished - waiting for confirmation")
+        self.status_dot.config(fg=COLORS['accent_orange'])
+        self.terminal_output.insert(
+            tk.END,
+            "\n=== Meta-RL finished. Press OK in the popup to start Fuzzy Logic. ===\n",
+            'green'
+        )
+        self.terminal_output.see(tk.END)
+        self.root.lift()
+        self.root.attributes('-topmost', True)
+        self.root.after(50, lambda: self.root.attributes('-topmost', False))
+
+        proceed = messagebox.askokcancel(
+            "Meta-RL Finished",
+            "انتهى تدريب Meta-RL.\nاضغط OK للانتقال إلى Fuzzy Logic.",
+            parent=self.root
+        )
+
+        if proceed:
+            self._send_fuzzy_resume_signal()
+            self.status_label.config(text="Starting Fuzzy Logic...")
+            self.status_dot.config(fg=COLORS['accent_cyan'])
+            self.terminal_output.insert(tk.END, "[GUI] Fuzzy Logic confirmed by user.\n", 'green')
+            self.terminal_output.see(tk.END)
+        else:
+            self.waiting_for_fuzzy_confirmation = False
+            self.status_label.config(text="Meta-RL finished - waiting for confirmation")
+            self.status_dot.config(fg=COLORS['accent_orange'])
+            self.terminal_output.insert(
+                tk.END,
+                "[GUI] Fuzzy Logic start deferred. Use OK on the next popup to continue.\n",
+                'orange'
+            )
+            self.terminal_output.see(tk.END)
+            self.root.after(500, self._prompt_to_continue_fuzzy)
         
     def setup_styles(self):
         style = ttk.Style()
@@ -456,7 +517,7 @@ class TrainingGUI:
         
         self.setting_iterations = SettingRow(train_section.content, "Meta Iterations",
                                              1000, 100, 10000,
-                                        description="Total training rounds.\nMore = better model, takes longer.")
+                                        description="Training rounds for this run.\nIf Resume is enabled and the checkpoint already reached this value,\nthe app continues for extra rounds instead.")
         self.setting_iterations.pack(fill='x', pady=5)
         
         self.setting_batch = SettingRow(train_section.content, "Meta Batch Size",
@@ -1033,6 +1094,8 @@ class TrainingGUI:
         config = self.validate_inputs()
         if config is None:
             return
+        self.waiting_for_fuzzy_confirmation = False
+        self._reset_fuzzy_resume_signal()
 
         # Ensure external script starts with forced-death disabled.
         force_death_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.force_death_pct')
@@ -1045,13 +1108,14 @@ class TrainingGUI:
         # إذا لم يكن الاستئناف مفعّلاً، نمسح الـ checkpoint القديم حتى يبدأ التدريب من الصفر بالقيم الجديدة.
         # مسار المقارنة الضبابي لا يحتاج حذف النموذج؛ الحذف هنا يبقى مرتبطاً فقط ببدء تدريب Meta-RL من الصفر.
         if not config.get('resume'):
-            ckpt_path = os.path.join(config['checkpoint_dir'], 'best_model.pt')
-            if os.path.exists(ckpt_path):
-                try:
-                    os.remove(ckpt_path)
-                    print(f"[GUI] Deleted old checkpoint: {ckpt_path}", flush=True)
-                except Exception as e:
-                    print(f"[GUI] Warning: could not delete checkpoint: {e}", flush=True)
+            for ckpt_name in ('best_model.pt', 'latest_model.pt'):
+                ckpt_path = os.path.join(config['checkpoint_dir'], ckpt_name)
+                if os.path.exists(ckpt_path):
+                    try:
+                        os.remove(ckpt_path)
+                        print(f"[GUI] Deleted old checkpoint: {ckpt_path}", flush=True)
+                    except Exception as e:
+                        print(f"[GUI] Warning: could not delete checkpoint: {e}", flush=True)
 
         self.is_training = True
         self.output_queue = queue.Queue()
@@ -1142,9 +1206,24 @@ class TrainingGUI:
                         self.progress_var.set(progress)
                         self.progress_label.config(text=f"{progress:.1f}%")
                 elif "=== Running Fuzzy Logic Comparison ===" in line:
+                    self.waiting_for_fuzzy_confirmation = False
                     self.status_label.config(text="Running Fuzzy Logic...")
                     self.status_dot.config(fg=COLORS['accent_cyan'])
                     self.terminal_output.insert(tk.END, line, 'green')
+                    self.terminal_output.see(tk.END)
+                elif "=== Training finished ===" in line:
+                    self.status_label.config(text="Meta-RL finished")
+                    self.status_dot.config(fg=COLORS['accent_orange'])
+                    self.terminal_output.insert(tk.END, line, 'green')
+                    self.terminal_output.see(tk.END)
+                    if not self.waiting_for_fuzzy_confirmation:
+                        self.root.after(0, self._prompt_to_continue_fuzzy)
+                elif line.startswith("META_RL_DONE_WAITING_FOR_FUZZY_CONFIRM"):
+                    if not self.waiting_for_fuzzy_confirmation:
+                        self.root.after(0, self._prompt_to_continue_fuzzy)
+                elif line.startswith("FUZZY_CONFIRM_RECEIVED"):
+                    self.waiting_for_fuzzy_confirmation = False
+                    self.terminal_output.insert(tk.END, "[GUI] Continuing to Fuzzy Logic...\n", 'green')
                     self.terminal_output.see(tk.END)
                 elif line.startswith("WSN_STATE|"):
                     # WSN_STATE|n_awake|n_sleep|n_dead|n_links|pos_str|state_str
@@ -1212,6 +1291,7 @@ class TrainingGUI:
     def training_finished(self):
         self.is_training = False
         self.training_process = None
+        self.waiting_for_fuzzy_confirmation = False
         self.btn_start.set_enabled(True)
         self.btn_stop.set_enabled(False)
         self.status_label.config(text="Idle")
@@ -1221,9 +1301,11 @@ class TrainingGUI:
         
     def stop_training(self):
         self.is_training = False
+        self.waiting_for_fuzzy_confirmation = False
         if self.training_process:
             self.training_process.terminate()
             self.training_process = None
+        self._reset_fuzzy_resume_signal()
             
         self.btn_start.set_enabled(True)
         self.btn_stop.set_enabled(False)
