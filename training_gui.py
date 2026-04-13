@@ -329,9 +329,15 @@ class TrainingGUI:
             pass
 
     def _send_fuzzy_resume_signal(self):
+        self._write_fuzzy_signal('ok')
+
+    def _send_fuzzy_cancel_signal(self):
+        self._write_fuzzy_signal('cancel')
+
+    def _write_fuzzy_signal(self, signal_value):
         try:
             with open(self._fuzzy_resume_signal_path(), 'w') as f:
-                f.write('ok')
+                f.write(signal_value)
         except Exception as e:
             self.terminal_output.insert(tk.END, f"\n[GUI] Error sending fuzzy confirmation: {e}\n", 'red')
             self.terminal_output.see(tk.END)
@@ -355,7 +361,7 @@ class TrainingGUI:
 
         proceed = messagebox.askokcancel(
             "Meta-RL Finished",
-            "انتهى تدريب Meta-RL.\nاضغط OK للانتقال إلى Fuzzy Logic.",
+            "Meta-RL training has finished.\nPress OK to continue to Fuzzy Logic.",
             parent=self.root
         )
 
@@ -367,15 +373,15 @@ class TrainingGUI:
             self.terminal_output.see(tk.END)
         else:
             self.waiting_for_fuzzy_confirmation = False
-            self.status_label.config(text="Meta-RL finished - waiting for confirmation")
-            self.status_dot.config(fg=COLORS['accent_orange'])
+            self._send_fuzzy_cancel_signal()
+            self.status_label.config(text="Meta-RL finished - Fuzzy Logic cancelled")
+            self.status_dot.config(fg='#ef4444')
             self.terminal_output.insert(
                 tk.END,
-                "[GUI] Fuzzy Logic start deferred. Use OK on the next popup to continue.\n",
-                'orange'
+                "[GUI] Fuzzy Logic cancelled by user.\n",
+                'red'
             )
             self.terminal_output.see(tk.END)
-            self.root.after(500, self._prompt_to_continue_fuzzy)
         
     def setup_styles(self):
         style = ttk.Style()
@@ -1224,6 +1230,12 @@ class TrainingGUI:
                 elif line.startswith("FUZZY_CONFIRM_RECEIVED"):
                     self.waiting_for_fuzzy_confirmation = False
                     self.terminal_output.insert(tk.END, "[GUI] Continuing to Fuzzy Logic...\n", 'green')
+                    self.terminal_output.see(tk.END)
+                elif line.startswith("FUZZY_CONFIRM_CANCELLED") or "=== Fuzzy Logic skipped by user ===" in line:
+                    self.waiting_for_fuzzy_confirmation = False
+                    self.status_label.config(text="Fuzzy Logic cancelled")
+                    self.status_dot.config(fg='#ef4444')
+                    self.terminal_output.insert(tk.END, line, 'orange')
                     self.terminal_output.see(tk.END)
                 elif line.startswith("WSN_STATE|"):
                     # WSN_STATE|n_awake|n_sleep|n_dead|n_links|pos_str|state_str

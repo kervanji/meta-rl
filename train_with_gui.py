@@ -73,10 +73,13 @@ def wait_for_fuzzy_resume_signal(poll_interval=0.2):
             if os.path.exists(fpath):
                 with open(fpath, 'r') as f:
                     signal = f.read().strip().lower()
-                if signal == 'ok':
+                if signal in {'ok', 'cancel'}:
                     os.remove(fpath)
-                    print("FUZZY_CONFIRM_RECEIVED", flush=True)
-                    return
+                    if signal == 'ok':
+                        print("FUZZY_CONFIRM_RECEIVED", flush=True)
+                        return True
+                    print("FUZZY_CONFIRM_CANCELLED", flush=True)
+                    return False
         except Exception:
             pass
         time.sleep(poll_interval)
@@ -975,8 +978,11 @@ def main():
     print("=== Training finished ===", flush=True)
 
     if args.fuzzy_after_training:
-        wait_for_fuzzy_resume_signal()
-        run_fuzzy_logic_comparison(args, env_config, _eval_tasks)
+        should_run_fuzzy = wait_for_fuzzy_resume_signal()
+        if should_run_fuzzy:
+            run_fuzzy_logic_comparison(args, env_config, _eval_tasks)
+        else:
+            print("=== Fuzzy Logic skipped by user ===", flush=True)
 
 
 if __name__ == "__main__":
